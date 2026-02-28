@@ -1,11 +1,15 @@
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #define SUCCESS 0
 #define FAILURE -1
-#define MIN_NUM_ARGS 1
 
 typedef struct {
   char *server;
@@ -15,9 +19,33 @@ typedef struct {
   char *type;
 } dns_args_t;
 
-void print_usage();
+typedef struct {
+  uint16_t id;
+  uint16_t flags;
+  uint16_t question_count;
+  uint16_t answer_count;
+  uint16_t name_server_count;
+  uint16_t additional_records_count;
+} __attribute__((packed)) dns_header_t;
 
-int main(int argc, char *argv[]) { print_usage(); }
+typedef struct {
+  uint16_t qtype;
+  uint16_t qclass;
+} __attribute__((packed)) dns_question_t;
+
+void print_usage();
+int parse_command_line(int argc, char *argv[], dns_args_t *args);
+
+int main(int argc, char *argv[]) {
+  dns_args_t args = {0};
+  if (parse_command_line(argc, argv, &args) == FAILURE) {
+    return EXIT_FAILURE;
+  }
+
+  uint8_t buf[512]; // standard DNS UDP message size limit
+
+  return EXIT_SUCCESS;
+}
 
 void print_usage() {
   printf(
@@ -38,40 +66,33 @@ void print_usage() {
       "\t\t\tDisplay this help and exit\n");
 }
 
-int parse_command_line(int argc, char *argv[], dns_args_t *dns) {
-  if (argc < MIN_NUM_ARGS + 1) {
-    fprintf(stderr, "Error: not enough arguments are provided\n");
-    print_usage();
-    return FAILURE;
+bool parse_int(const char *value, int *out) {
+  char *end;
+  int result = (int)strtol(value, &end, 10);
+  if (end == value || *end != '\0' || result < 0) {
+    return false;
   }
+  *out = result;
+  return true;
+}
 
+int parse_command_line(int argc, char *argv[], dns_args_t *args) {
   int curr = 1;
 
   // [options]
-  dns->server = "127.0.0.53";
-  dns->retries = 3;
-  dns->timeout = 1;
+  args->server = "127.0.0.53";
+  args->retries = 3;
+  args->timeout = 1;
   while (argv[curr][0] == '-' && curr + 1 < argc) {
     char *option = argv[curr];
     char *value = argv[curr + 1];
     bool is_valid = true;
-    char *end;
     if (strcmp(option, "-s") == 0 || strcmp(option, "--server") == 0) {
-      dns->server = value;
+      args->server = value;
     } else if (strcmp(option, "-r") == 0 || strcmp(option, "--retries") == 0) {
-      int retries = (int)strtol(value, &end, 10);
-      if (end == value || *end != '\0' || retries < 0) {
-        is_valid = false;
-      } else {
-        dns->retries = retries;
-      }
+      is_valid = parse_int(value, &args->retries);
     } else if (strcmp(option, "-t") == 0 || strcmp(option, "--timeout") == 0) {
-      int timeout = (int)strtol(value, &end, 10);
-      if (end == value || *end != '\0' || timeout < 0) {
-        is_valid = false;
-      } else {
-        dns->timeout = timeout;
-      }
+      is_valid = parse_int(value, &args->timeout);
     } else {
       is_valid = false;
     }
@@ -89,22 +110,22 @@ int parse_command_line(int argc, char *argv[], dns_args_t *dns) {
     fprintf(stderr, "Error: no <query> is provided\n");
     return FAILURE;
   }
-  dns->query = argv[curr++];
+  args->query = argv[curr++];
 
   // [TYPE]
-  dns->type = "A";
+  args->type = "A";
   if (curr < argc) {
     char *type = argv[curr];
     if (strcmp(type, "AAAA") == 0) {
-      dns->type = "AAAA";
+      args->type = "AAAA";
     } else if (strcmp(type, "MX") == 0) {
-      dns->type = "MX";
+      args->type = "MX";
     } else if (strcmp(type, "CNAME") == 0) {
-      dns->type = "CNAME";
+      args->type = "CNAME";
     } else if (strcmp(type, "NS") == 0) {
-      dns->type = "NS";
+      args->type = "NS";
     } else if (strcmp(type, "TXT") == 0) {
-      dns->type = "TXT";
+      args->type = "TXT";
     } else if (strcmp(type, "A") != 0) {
       fprintf(stderr, "Error: invalid TYPE\n");
       return FAILURE;
@@ -114,8 +135,82 @@ int parse_command_line(int argc, char *argv[], dns_args_t *dns) {
 
   if (curr < argc) {
     fprintf(stderr, "Error: too many arguments are provided\n");
-    print_usage();
+    return FAILURE;
   }
 
   return SUCCESS;
+}
+
+int encode_name(const char *domain, uint8_t *buf) {
+  uint8_t *start = buf;
+  char *dot;
+  int length;
+  while (*domain != '\0') {
+    dot = strchr(domain, '.');
+    if (dot) {
+      length = dot - domain;
+    } else {
+      length = strlen(domain);
+    }
+
+    *buf++ = length;
+    for (int i = 0; i < length; i++) {
+      *buf++ = *domain++;
+    }
+
+    if (dot) {
+      domain++;
+    }
+  }
+
+  *buf++ = '\0';
+
+  return buf - start;
+}
+
+uint16_t type_to_number(const char *type) {
+  uint16_t result = 1; // defaults to "A"
+  if (strcmp(type, "NS") == 0) {
+    result = 2;
+  } else if (strcmp(type, "CNAME") == 0) {
+    result = 5;
+  } else if (strcmp(type, "MX") == 0) {
+    result = 15;
+  } else if (strcmp(type, "TXT") == 0) {
+    result = 16;
+  } else if (strcmp(type, "AAAA") == 0) {
+    result = 28;
+  }
+  return result;
+}
+
+int build_query(const char *domain, uint16_t qtype, uint8_t *buf) {
+  uint8_t *start = buf;
+
+  dns_header_t header = {.id = htons(getpid()),
+                         .flags = htons(0x0100), // literally just set recursion
+                         .question_count = htons(1),
+                         .answer_count = htons(0),
+                         .name_server_count = htons(0),
+                         .additional_records_count = htons(0)};
+  memcpy(buf, &header, sizeof(dns_header_t));
+  buf += sizeof(dns_header_t);
+
+  int encoded = encode_name(domain, buf);
+  buf += encoded;
+
+  dns_question_t question = {.qtype = htons(qtype), .qclass = htons(1)};
+  memcpy(buf, &question, sizeof(dns_question_t));
+  buf += sizeof(dns_question_t);
+
+  return buf - start;
+}
+
+int send_dns_query(uint8_t *buf, int buf_len, const char *server_ip) {
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+  struct sockaddr_in server;
+  server.sin_family = AF_INET;
+  server.sin_port = htons(53);
+  inet_aton(server_ip, &server.sin_addr);
 }
