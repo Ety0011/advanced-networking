@@ -10,6 +10,7 @@
 
 #define SUCCESS 0
 #define FAILURE -1
+#define DNS_PORT 53
 
 typedef struct {
   char *server;
@@ -34,7 +35,12 @@ typedef struct {
 } __attribute__((packed)) dns_question_t;
 
 void print_usage();
+bool parse_int(const char *value, int *out);
 int parse_command_line(int argc, char *argv[], dns_args_t *args);
+int encode_name(const char *domain, uint8_t *buf);
+uint16_t type_to_qtype(const char *type);
+int build_packet(const char *domain, const char *qtype, uint8_t *packet);
+int send_dns_query(uint8_t *packet, int packet_len, const char *server_ip);
 
 int main(int argc, char *argv[]) {
   dns_args_t args = {0};
@@ -42,7 +48,8 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  uint8_t buf[512]; // standard DNS UDP message size limit
+  uint8_t packet[512]; // standard DNS UDP message size limit
+  int packet_len = build_packet(args.query, args.type, packet);
 
   return EXIT_SUCCESS;
 }
@@ -83,10 +90,16 @@ int parse_command_line(int argc, char *argv[], dns_args_t *args) {
   args->server = "127.0.0.53";
   args->retries = 3;
   args->timeout = 1;
-  while (argv[curr][0] == '-' && curr + 1 < argc) {
+  while (curr < argc && argv[curr][0] == '-') {
     char *option = argv[curr];
-    char *value = argv[curr + 1];
+    int next = curr + 1;
+    if (next == argc) {
+      fprintf(stderr, "Error: option %s requires a value\n", option);
+      return FAILURE;
+    }
+
     bool is_valid = true;
+    char *value = argv[next];
     if (strcmp(option, "-s") == 0 || strcmp(option, "--server") == 0) {
       args->server = value;
     } else if (strcmp(option, "-r") == 0 || strcmp(option, "--retries") == 0) {
@@ -168,7 +181,7 @@ int encode_name(const char *domain, uint8_t *buf) {
   return buf - start;
 }
 
-uint16_t type_to_number(const char *type) {
+uint16_t type_to_qtype(const char *type) {
   uint16_t result = 1; // defaults to "A"
   if (strcmp(type, "NS") == 0) {
     result = 2;
@@ -184,8 +197,8 @@ uint16_t type_to_number(const char *type) {
   return result;
 }
 
-int build_query(const char *domain, uint16_t qtype, uint8_t *buf) {
-  uint8_t *start = buf;
+int build_packet(const char *domain, const char *qtype, uint8_t *packet) {
+  uint8_t *start = packet;
 
   dns_header_t header = {.id = htons(getpid()),
                          .flags = htons(0x0100), // literally just set recursion
@@ -193,24 +206,28 @@ int build_query(const char *domain, uint16_t qtype, uint8_t *buf) {
                          .answer_count = htons(0),
                          .name_server_count = htons(0),
                          .additional_records_count = htons(0)};
-  memcpy(buf, &header, sizeof(dns_header_t));
-  buf += sizeof(dns_header_t);
+  memcpy(packet, &header, sizeof(dns_header_t));
+  packet += sizeof(dns_header_t);
 
-  int encoded = encode_name(domain, buf);
-  buf += encoded;
+  int encoded = encode_name(domain, packet);
+  packet += encoded;
 
-  dns_question_t question = {.qtype = htons(qtype), .qclass = htons(1)};
-  memcpy(buf, &question, sizeof(dns_question_t));
-  buf += sizeof(dns_question_t);
+  dns_question_t question = {.qtype = htons(type_to_qtype(qtype)),
+                             .qclass = htons(1)};
+  memcpy(packet, &question, sizeof(dns_question_t));
+  packet += sizeof(dns_question_t);
 
-  return buf - start;
+  return packet - start;
 }
 
-int send_dns_query(uint8_t *buf, int buf_len, const char *server_ip) {
+int send_dns_query(uint8_t *packet, int packet_len, const char *server_ip) {
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
   struct sockaddr_in server;
   server.sin_family = AF_INET;
-  server.sin_port = htons(53);
+  server.sin_port = htons(DNS_PORT);
   inet_aton(server_ip, &server.sin_addr);
+
+  sendto(sock, packet, packet_len, 0, (struct sockaddr *)&server,
+         sizeof(server));
 }
