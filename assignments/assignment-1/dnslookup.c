@@ -93,6 +93,7 @@ int main(int argc, char *argv[]) {
 
   dns_message message = parse_response(response, response_len);
   printf("id: %u", message.header.id);
+  printf("name: %s\n", message.answers[0].name);
 
   return EXIT_SUCCESS;
 }
@@ -274,15 +275,12 @@ int build_request(const char *qname, const char *qtype, uint8_t *request) {
   memcpy(request, &header, sizeof(dns_header));
   request += sizeof(dns_header);
 
-  dns_question question;
-  int encoded_len = encode_qname(qname, (uint8_t *)question.qname);
-  question.qtype = htons(qtype_to_str(qtype));
-  question.qclass = htons(1);
-  memcpy(request, question.qname, encoded_len);
+  int encoded_len = encode_qname(qname, request);
   request += encoded_len;
-  memcpy(request, &question.qtype, 2);
+  // direct cast avoids the temp variable that memcpy would require
+  *((uint16_t *)request) = htons(qtype_to_str(qtype));
   request += 2;
-  memcpy(request, &question.qclass, 2);
+  *((uint16_t *)request) = htons(1);
   request += 2;
 
   return request - start;
@@ -360,12 +358,10 @@ int parse_question(uint8_t *response, int offset, dns_question *question) {
   int decoded = decode_qname(response, offset, question->qname);
   offset += decoded;
 
-  memcpy(&question->qtype, response + offset, 2);
-  question->qtype = ntohs(question->qtype);
+  question->qtype = ntohs(*((uint16_t *)(response + offset)));
   offset += 2;
 
-  memcpy(&question->qclass, response + offset, 2);
-  question->qclass = ntohs(question->qclass);
+  question->qclass = ntohs(*((uint16_t *)(response + offset)));
   offset += 2;
 
   return offset - original_offset;
@@ -376,20 +372,16 @@ int parse_record(uint8_t *response, int offset, dns_record *record) {
   int decoded = decode_qname(response, offset, record->name);
   offset += decoded;
 
-  memcpy(&record->type, response + offset, 2);
-  record->type = ntohs(record->type);
+  record->type = ntohs(*((uint16_t *)(response + offset)));
   offset += 2;
 
-  memcpy(&record->class, response + offset, 2);
-  record->class = ntohs(record->class);
+  record->class = ntohs(*((uint16_t *)(response + offset)));
   offset += 2;
 
-  memcpy(&record->ttl, response + offset, 4);
-  record->ttl = ntohl(record->ttl);
+  record->ttl = ntohl(*((uint32_t *)(response + offset)));
   offset += 4;
 
-  memcpy(&record->rdlength, response + offset, 2);
-  record->rdlength = ntohs(record->rdlength);
+  record->rdlength = ntohs(*((uint16_t *)(response + offset)));
   offset += 2;
 
   switch (record->type) {
@@ -403,9 +395,7 @@ int parse_record(uint8_t *response, int offset, dns_record *record) {
     decode_qname(response, offset, record->rdata);
     break;
   case DNS_TYPE_MX: { // <- brackets for any case that defines variables
-    uint16_t preference;
-    memcpy(&preference, response + offset, 2);
-    preference = ntohs(preference);
+    uint16_t preference = ntohs(*((uint16_t *)(response + offset)));
     int written = sprintf(record->rdata, "%d\t", preference);
     decode_qname(response, offset + 2, record->rdata + written);
     break;
