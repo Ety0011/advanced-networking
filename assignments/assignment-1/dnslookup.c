@@ -34,12 +34,12 @@ typedef struct {
 } dns_args;
 
 typedef struct {
-  uint16_t id;
-  uint16_t flags;
-  uint16_t qdcount;
-  uint16_t ancount;
-  uint16_t nscount;
-  uint16_t arcount;
+  uint16_t id;      // unique identifier to match responses to requests
+  uint16_t flags;   // QR, opcode, AA, TC, RD, RA, Z, RCODE packed into 16 bits
+  uint16_t qdcount; // number of questions
+  uint16_t ancount; // number of answer records
+  uint16_t nscount; // number of authority (name server) records
+  uint16_t arcount; // number of additional records
 } __attribute__((packed)) dns_header;
 
 typedef struct {
@@ -68,12 +68,13 @@ typedef struct {
 void print_usage();
 bool parse_int(const char *value, int *out);
 int parse_command_line(int argc, char *argv[], dns_args *args);
-int encode_qname(const char *qname, uint8_t *buf);
-uint16_t qtype_to_str(const char *type);
+int encode_name(const char *qname, uint8_t *buf);
+uint16_t str_to_type(const char *type);
 int build_request(const char *qname, const char *qtype, uint8_t *packet);
 int send_request(uint8_t *request, int request_len, dns_args *args,
                  uint8_t response[]);
 dns_message parse_response(uint8_t *response, int response_len);
+void print_message(dns_message *message);
 
 int main(int argc, char *argv[]) {
   dns_args args = {0};
@@ -87,13 +88,13 @@ int main(int argc, char *argv[]) {
   uint8_t response[UDP_MAX_PAYLOAD_SIZE];
   int response_len = send_request(request, request_len, &args, response);
   if (response_len == FAILURE) {
-    fprintf(stderr, "Error: could not send request");
+    fprintf(stderr, "Error: could not send request\n");
     return EXIT_FAILURE;
   }
 
   dns_message message = parse_response(response, response_len);
-  printf("id: %u\n", message.header.id);
-  printf("name: %s\n", message.answers[0].name);
+
+  print_message(&message);
 
   return EXIT_SUCCESS;
 }
@@ -198,7 +199,7 @@ int parse_command_line(int argc, char *argv[], dns_args *args) {
   return SUCCESS;
 }
 
-int encode_qname(const char *qname, uint8_t *request) {
+int encode_name(const char *qname, uint8_t *request) {
   uint8_t *start = request;
   char *dot;
   int len;
@@ -225,15 +226,15 @@ int encode_qname(const char *qname, uint8_t *request) {
   return request - start;
 }
 
-int decode_qname(uint8_t *response, int offset, char *out) {
-  char *start_out = out;
+int decode_name(uint8_t *response, int offset, char *out) {
+  int start_offset = offset;
 
   while (response[offset] != '\0') {
     if ((response[offset] & DNS_PTR_MASK) == DNS_PTR_MASK) {
       int jump = ((response[offset] & 0x3F) << 8) | response[offset + 1];
-      int decoded = decode_qname(response, jump, out);
-      out += decoded;
-      break;
+      decode_name(response, jump, out);
+      offset += 2;
+      return offset - start_offset;
     }
 
     int len = response[offset++];
@@ -244,10 +245,11 @@ int decode_qname(uint8_t *response, int offset, char *out) {
   }
 
   *out = '\0';
-  return out - start_out + 1;
+  offset++; // skip the \0 terminator
+  return offset - start_offset;
 }
 
-uint16_t qtype_to_str(const char *type) {
+uint16_t str_to_type(const char *type) {
   uint16_t result = 1; // defaults to "A"
   if (strcmp(type, "NS") == 0) {
     result = 2;
@@ -259,6 +261,47 @@ uint16_t qtype_to_str(const char *type) {
     result = 16;
   } else if (strcmp(type, "AAAA") == 0) {
     result = 28;
+  }
+  return result;
+}
+
+char *type_to_str(uint16_t type) {
+  char *result;
+  switch (type) {
+  case 1:
+    result = "A";
+    break;
+  case 2:
+    result = "NS";
+    break;
+  case 5:
+    result = "CNAME";
+    break;
+  case 15:
+    result = "MX";
+    break;
+  case 16:
+    result = "TXT";
+    break;
+  case 28:
+    result = "AAAA";
+    break;
+  default:
+    result = "A";
+    break;
+  }
+  return result;
+}
+
+char *class_to_str(uint16_t class) {
+  char *result;
+  switch (class) {
+  case 1:
+    result = "IN";
+    break;
+  default:
+    result = "UNKNOWN";
+    break;
   }
   return result;
 }
@@ -275,12 +318,12 @@ int build_request(const char *qname, const char *qtype, uint8_t *request) {
   memcpy(request, &header, sizeof(dns_header));
   request += sizeof(dns_header);
 
-  int encoded_len = encode_qname(qname, request);
+  int encoded_len = encode_name(qname, request);
   request += encoded_len;
   // direct cast avoids the temp variable that memcpy would require
-  *((uint16_t *)request) = htons(qtype_to_str(qtype));
+  *((uint16_t *)request) = htons(str_to_type(qtype));
   request += 2;
-  *((uint16_t *)request) = htons(1);
+  *((uint16_t *)request) = htons(1); // 1 == IN, there is nothing else
   request += 2;
 
   return request - start;
@@ -355,7 +398,7 @@ int parse_header(uint8_t *response, int offset, dns_header *header) {
 
 int parse_question(uint8_t *response, int offset, dns_question *question) {
   int original_offset = offset;
-  int decoded = decode_qname(response, offset, question->qname);
+  int decoded = decode_name(response, offset, question->qname);
   offset += decoded;
 
   question->qtype = ntohs(*((uint16_t *)(response + offset)));
@@ -369,7 +412,7 @@ int parse_question(uint8_t *response, int offset, dns_question *question) {
 
 int parse_record(uint8_t *response, int offset, dns_record *record) {
   int original_offset = offset;
-  int decoded = decode_qname(response, offset, record->name);
+  int decoded = decode_name(response, offset, record->name);
   offset += decoded;
 
   record->type = ntohs(*((uint16_t *)(response + offset)));
@@ -389,15 +432,15 @@ int parse_record(uint8_t *response, int offset, dns_record *record) {
     inet_ntop(AF_INET, response + offset, record->rdata, sizeof(record->rdata));
     break;
   case DNS_TYPE_NS:
-    decode_qname(response, offset, record->rdata);
+    decode_name(response, offset, record->rdata);
     break;
   case DNS_TYPE_CNAME:
-    decode_qname(response, offset, record->rdata);
+    decode_name(response, offset, record->rdata);
     break;
   case DNS_TYPE_MX: { // <- brackets for any case that defines variables
     uint16_t preference = ntohs(*((uint16_t *)(response + offset)));
     int written = sprintf(record->rdata, "%d\t", preference);
-    decode_qname(response, offset + 2, record->rdata + written);
+    decode_name(response, offset + 2, record->rdata + written);
     break;
   }
   case DNS_TYPE_TXT: {
@@ -439,4 +482,43 @@ dns_message parse_response(uint8_t *response, int response_len) {
   }
 
   return message;
+}
+
+void print_record(dns_record *record) {
+  printf("%s\t%d\t%s\t%s\t%s\n", record->name, record->ttl,
+         class_to_str(record->class), type_to_str(record->type), record->rdata);
+}
+
+void print_message(dns_message *message) {
+  printf("QUERY: %d, ANSWER: %d, AUTHORITY: %d, ADDITIONAL: %d\n\n",
+         message->header.qdcount, message->header.ancount,
+         message->header.nscount, message->header.arcount);
+
+  if (message->header.qdcount > 0) {
+    printf("QUESTION SECTION:\n");
+    printf("%s\t\t%s\t%s\n\n", message->question.qname,
+           class_to_str(message->question.qclass),
+           type_to_str(message->question.qtype));
+  }
+
+  if (message->header.ancount > 0) {
+    printf("ANSWER SECTION:\n");
+    for (int i = 0; i < message->header.ancount; i++) {
+      print_record(&message->answers[i]);
+    }
+  }
+
+  if (message->header.nscount > 0) {
+    printf("AUTHORITY SECTION:\n");
+    for (int i = 0; i < message->header.nscount; i++) {
+      print_record(&message->authority[i]);
+    }
+  }
+
+  if (message->header.arcount > 0) {
+    printf("ADDITIONAL SECTION:\n");
+    for (int i = 0; i < message->header.arcount; i++) {
+      print_record(&message->additional[i]);
+    }
+  }
 }
