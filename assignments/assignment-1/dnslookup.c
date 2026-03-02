@@ -92,7 +92,7 @@ int main(int argc, char *argv[]) {
   }
 
   dns_message message = parse_response(response, response_len);
-  printf("id: %u", message.header.id);
+  printf("id: %u\n", message.header.id);
   printf("name: %s\n", message.answers[0].name);
 
   return EXIT_SUCCESS;
@@ -266,7 +266,7 @@ uint16_t qtype_to_str(const char *type) {
 int build_request(const char *qname, const char *qtype, uint8_t *request) {
   uint8_t *start = request;
 
-  dns_header header = {.id = htons(getpid()),
+  dns_header header = {.id = htons(rand() % UINT16_MAX + 1),
                        .flags = htons(0x0100), // literally just set recursion
                        .qdcount = htons(1),
                        .ancount = htons(0),
