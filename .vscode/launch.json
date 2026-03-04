@@ -9,12 +9,17 @@
       "type": "cppdbg",
       "request": "launch",
       "program": "${workspaceFolder}/out/build/clang/advanced-networking",
-      "args": [],
+      "args": [
+        "-s",
+        "8.8.8.8",
+        "google.com"
+      ],
       "stopAtEntry": false,
       "cwd": "${fileDirname}",
       "environment": [],
       "externalConsole": false,
-      "MIMode": "lldb"
+      "MIMode": "lldb",
+      // "preLaunchTask": "CMake: build"
     }
   ]
 }
