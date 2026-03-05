@@ -11,8 +11,10 @@
 #define SUCCESS 0
 #define FAILURE -1
 #define DNS_PORT 53
-#define UDP_MAX_PAYLOAD_SIZE 65507 // 65535 - 8 (UDP header) - 20 (IP header)
-#define DNS_MAX_UDP_SIZE 512       // RFC 1035 limit
+#define DNS_MAX_MESSAGE_SIZE 512 // RFC 1035: max DNS message size over UDP
+#define DNS_MAX_RECORD_COUNT 50  // DNS_MAX_MESSAGE_SIZE / 12 approx = 43 -> 50
+#define DNS_MAX_NAME_SIZE                                                      \
+  256 // RFC 1035: max domain name length is 255 + null terminator
 #define DNS_PTR_MASK                                                           \
   0xC0 // top 2 bits set, signals this is a compression pointer not a label
        // length
@@ -22,8 +24,7 @@
 #define DNS_TYPE_MX 15
 #define DNS_TYPE_TXT 16
 #define DNS_TYPE_AAAA 28
-#define MAX_NUM_RECORDS                                                        \
-  50 // record is at minimum 12 bytes -> 512 / 12 = 42, we round to 50
+#define DNS_CLASS_IN 1
 
 typedef struct {
   char *server_addr;
@@ -40,29 +41,29 @@ typedef struct {
   uint16_t ancount; // number of answer records
   uint16_t nscount; // number of authority (name server) records
   uint16_t arcount; // number of additional records
-} __attribute__((packed)) dns_header;
+} __attribute__((packed)) dns_header; // remove compiler padding
 
 typedef struct {
-  char qname[256];
+  char qname[DNS_MAX_NAME_SIZE];
   uint16_t qtype;
   uint16_t qclass;
 } __attribute__((packed)) dns_question;
 
 typedef struct {
-  char name[256];
+  char name[DNS_MAX_NAME_SIZE];
   uint16_t type;
   uint16_t class;
   uint32_t ttl;
   uint16_t rdlength;
-  char rdata[512];
+  char rdata[DNS_MAX_MESSAGE_SIZE];
 } dns_record;
 
 typedef struct {
   dns_header header;
   dns_question question;
-  dns_record answers[MAX_NUM_RECORDS];
-  dns_record authority[MAX_NUM_RECORDS];
-  dns_record additional[MAX_NUM_RECORDS];
+  dns_record answers[DNS_MAX_RECORD_COUNT];
+  dns_record authority[DNS_MAX_RECORD_COUNT];
+  dns_record additional[DNS_MAX_RECORD_COUNT];
 } dns_message;
 
 void print_usage();
@@ -82,10 +83,10 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  uint8_t request[DNS_MAX_UDP_SIZE];
+  uint8_t request[DNS_MAX_MESSAGE_SIZE];
   int request_len = build_request(args.qname, args.qtype, request);
 
-  uint8_t response[UDP_MAX_PAYLOAD_SIZE];
+  uint8_t response[DNS_MAX_MESSAGE_SIZE];
   int response_len = send_request(request, request_len, &args, response);
   if (response_len == FAILURE) {
     fprintf(stderr, "Error: could not send request\n");
@@ -268,22 +269,22 @@ uint16_t str_to_type(const char *type) {
 char *type_to_str(uint16_t type) {
   char *result;
   switch (type) {
-  case 1:
+  case DNS_TYPE_A:
     result = "A";
     break;
-  case 2:
+  case DNS_TYPE_NS:
     result = "NS";
     break;
-  case 5:
+  case DNS_TYPE_CNAME:
     result = "CNAME";
     break;
-  case 15:
+  case DNS_TYPE_MX:
     result = "MX";
     break;
-  case 16:
+  case DNS_TYPE_TXT:
     result = "TXT";
     break;
-  case 28:
+  case DNS_TYPE_AAAA:
     result = "AAAA";
     break;
   default:
@@ -323,7 +324,7 @@ int build_request(const char *qname, const char *qtype, uint8_t *request) {
   // direct cast avoids the temp variable that memcpy would require
   *((uint16_t *)request) = htons(str_to_type(qtype));
   request += 2;
-  *((uint16_t *)request) = htons(1); // 1 == IN, there is nothing else
+  *((uint16_t *)request) = htons(DNS_CLASS_IN);
   request += 2;
 
   return request - start;
@@ -372,7 +373,7 @@ int send_request(uint8_t *request, int request_len, dns_args *args,
       return FAILURE;
     }
 
-    response_len = recvfrom(sock_fd, response, UDP_MAX_PAYLOAD_SIZE, 0,
+    response_len = recvfrom(sock_fd, response, DNS_MAX_MESSAGE_SIZE, 0,
                             (struct sockaddr *)&from_addr, &from_addr_len);
     if (response_len == FAILURE) {
       perror("recvfrom");
