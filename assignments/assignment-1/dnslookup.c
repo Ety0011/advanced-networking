@@ -8,16 +8,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define SUCCESS 0
-#define FAILURE -1
 #define DNS_PORT 53
-#define DNS_MAX_MESSAGE_SIZE 512 // RFC 1035: max DNS message size over UDP
-#define DNS_MAX_RECORD_COUNT 50  // DNS_MAX_MESSAGE_SIZE / 12 approx = 43 -> 50
-#define DNS_MAX_NAME_SIZE                                                      \
-  256 // RFC 1035: max domain name length is 255 + null terminator
-#define DNS_PTR_MASK                                                           \
-  0xC0 // top 2 bits set, signals this is a compression pointer not a label
-       // length
+#define DNS_MAX_MESSAGE_SIZE 512 // max DNS message size over UDP
+#define DNS_MAX_RECORD_COUNT 50
+#define DNS_MAX_NAME_SIZE 256 // max domain name length is 255 + null terminator
+#define DNS_POINTER_MASK 0xC0 // signal for compression pointer not label
+// length
+#define DNS_FLAG_RD 0x0100
+#define DNS_FLAG_TC 0x0200
 #define DNS_TYPE_A 1
 #define DNS_TYPE_NS 2
 #define DNS_TYPE_CNAME 5
@@ -26,38 +24,45 @@
 #define DNS_TYPE_AAAA 28
 #define DNS_CLASS_IN 1
 
+// holds the configuration derived from command-line arguments
 typedef struct {
-  char *server_addr;
-  int retries;
-  int timeout;
-  char *qname;
-  char *qtype;
-} dns_args;
+  char *server_addr; // IPv4 address of the DNS resolver
+  int retries;       // maximum number of attempts before giving up
+  int timeout;       // per-attempt receive timeout in seconds
+  char *qname;       // domain name to query
+  char *qtype;       // record type string (A, AAAA, MX, ...)
+} dns_config;
 
+// maps exactly onto the 12-byte DNS wire header.
+// packed so that memcpy of raw packet buffer produces the correct byte layout.
 typedef struct {
-  uint16_t id;      // unique identifier to match responses to requests
-  uint16_t flags;   // QR, opcode, AA, TC, RD, RA, Z, RCODE packed into 16 bits
+  uint16_t id;      // unique ID to match responses to requests
+  uint16_t flags;   // QR, opcode, AA, TC, RD, RA, Z, RCODE
   uint16_t qdcount; // number of questions
   uint16_t ancount; // number of answer records
-  uint16_t nscount; // number of authority (name server) records
+  uint16_t nscount; // number of authority records
   uint16_t arcount; // number of additional records
-} __attribute__((packed)) dns_header; // remove compiler padding
+} __attribute__((packed)) dns_header;
 
+// maps exactly onto the fixed trailing fields of a DNS question entry;
+// packed for the same reason as dns_header.
 typedef struct {
-  char qname[DNS_MAX_NAME_SIZE];
-  uint16_t qtype;
-  uint16_t qclass;
+  char qname[DNS_MAX_NAME_SIZE]; // encoded query name
+  uint16_t qtype;                // query type (A, MX, ...)
+  uint16_t qclass;               // query class (always IN = 1)
 } __attribute__((packed)) dns_question;
 
+// internal representation of a single parsed resource record.
 typedef struct {
-  char name[DNS_MAX_NAME_SIZE];
-  uint16_t type;
-  uint16_t class;
-  uint32_t ttl;
-  uint16_t rdlength;
-  char rdata[DNS_MAX_MESSAGE_SIZE];
+  char name[DNS_MAX_NAME_SIZE];     // owner name
+  uint16_t type;                    // record type
+  uint16_t class;                   // record class
+  uint32_t ttl;                     // time to live in seconds
+  uint16_t rdlength;                // length of rdata in bytes
+  char rdata[DNS_MAX_MESSAGE_SIZE]; // parsed record data
 } dns_record;
 
+// internal representation of a full DNS message.
 typedef struct {
   dns_header header;
   dns_question question;
@@ -66,42 +71,45 @@ typedef struct {
   dns_record additional[DNS_MAX_RECORD_COUNT];
 } dns_message;
 
-void print_usage();
-bool parse_int(const char *value, int *out);
-int parse_command_line(int argc, char *argv[], dns_args *args);
-int encode_name(const char *qname, uint8_t *buf);
-uint16_t str_to_type(const char *type);
+int parse_command_line(int argc, char *argv[], dns_config *config);
 int build_request(const char *qname, const char *qtype, uint8_t *packet);
-int send_request(uint8_t *request, int request_len, dns_args *args,
+int send_request(uint8_t *request, int request_len, dns_config *config,
                  uint8_t response[]);
 dns_message parse_response(uint8_t *response, int response_len);
 void print_message(dns_message *message);
 
 int main(int argc, char *argv[]) {
-  dns_args args = {0};
-  if (parse_command_line(argc, argv, &args) == FAILURE) {
+  dns_config configs = {0};
+  int result = parse_command_line(argc, argv, &configs);
+  if (result > 0) {
+    return EXIT_SUCCESS;
+  } else if (result < 0) {
     return EXIT_FAILURE;
   }
 
   uint8_t request[DNS_MAX_MESSAGE_SIZE];
-  int request_len = build_request(args.qname, args.qtype, request);
+  int request_len = build_request(configs.qname, configs.qtype, request);
 
   uint8_t response[DNS_MAX_MESSAGE_SIZE];
-  int response_len = send_request(request, request_len, &args, response);
-  if (response_len == FAILURE) {
-    fprintf(stderr, "Error: could not send request\n");
+  int response_len = send_request(request, request_len, &configs, response);
+  if (response_len < 0) {
     return EXIT_FAILURE;
   }
 
   dns_message message = parse_response(response, response_len);
+  if (message.header.flags & DNS_FLAG_TC) {
+    fprintf(stderr, "Error: response was truncated\n");
+    return EXIT_FAILURE;
+  }
 
   print_message(&message);
 
   return EXIT_SUCCESS;
 }
 
-void print_usage() {
-  printf(
+void print_help() {
+  fprintf(
+      stderr,
       "Usage: ./dnslookup [options] <query> [TYPE]\n\n"
       "Arguments:\n"
       "\tquery\tThe DNS query to solve\n"
@@ -129,75 +137,84 @@ bool parse_int(const char *value, int *out) {
   return true;
 }
 
-int parse_command_line(int argc, char *argv[], dns_args *args) {
+int parse_command_line(int argc, char *argv[], dns_config *config) {
   int curr = 1;
 
   // [options]
-  args->server_addr = "127.0.0.53";
-  args->retries = 3;
-  args->timeout = 1;
+  config->server_addr = "127.0.0.53";
+  config->retries = 3;
+  config->timeout = 1;
   while (curr < argc && argv[curr][0] == '-') {
     char *option = argv[curr];
+
+    if (strcmp(option, "-h") == 0 || strcmp(option, "--help") == 0) {
+      print_help();
+      return 1;
+    }
+
     int next = curr + 1;
     if (next == argc) {
       fprintf(stderr, "Error: option %s requires a value\n", option);
-      return FAILURE;
+      return -1;
     }
 
     bool is_valid = true;
     char *value = argv[next];
     if (strcmp(option, "-s") == 0 || strcmp(option, "--server") == 0) {
-      args->server_addr = value;
+      config->server_addr = value;
     } else if (strcmp(option, "-r") == 0 || strcmp(option, "--retries") == 0) {
-      is_valid = parse_int(value, &args->retries);
+      if (!parse_int(value, &config->retries)) {
+        fprintf(stderr, "Error: invalid value %s for option %s\n", value,
+                option);
+        return -1;
+      }
     } else if (strcmp(option, "-t") == 0 || strcmp(option, "--timeout") == 0) {
-      is_valid = parse_int(value, &args->timeout);
+      if (!parse_int(value, &config->timeout)) {
+        fprintf(stderr, "Error: invalid value %s for option %s\n", value,
+                option);
+        return -1;
+      }
     } else {
-      is_valid = false;
-    }
-
-    if (!is_valid) {
-      fprintf(stderr, "Error: invalid option %s with value %s\n", option,
-              value);
-      return FAILURE;
+      fprintf(stderr, "Error: invalid option %s", option);
+      return -1;
     }
     curr += 2;
   }
 
   // <query>
-  if (curr == argc) {
+  if (curr >= argc) {
     fprintf(stderr, "Error: no <query> is provided\n");
-    return FAILURE;
+    return -1;
   }
-  args->qname = argv[curr++];
+  config->qname = argv[curr++];
 
   // [TYPE]
-  args->qtype = "A";
+  config->qtype = "A";
   if (curr < argc) {
     char *type = argv[curr];
     if (strcmp(type, "AAAA") == 0) {
-      args->qtype = "AAAA";
+      config->qtype = "AAAA";
     } else if (strcmp(type, "MX") == 0) {
-      args->qtype = "MX";
+      config->qtype = "MX";
     } else if (strcmp(type, "CNAME") == 0) {
-      args->qtype = "CNAME";
+      config->qtype = "CNAME";
     } else if (strcmp(type, "NS") == 0) {
-      args->qtype = "NS";
+      config->qtype = "NS";
     } else if (strcmp(type, "TXT") == 0) {
-      args->qtype = "TXT";
+      config->qtype = "TXT";
     } else if (strcmp(type, "A") != 0) {
       fprintf(stderr, "Error: invalid TYPE\n");
-      return FAILURE;
+      return -1;
     }
     curr++;
   }
 
   if (curr < argc) {
     fprintf(stderr, "Error: too many arguments are provided\n");
-    return FAILURE;
+    return -1;
   }
 
-  return SUCCESS;
+  return 0;
 }
 
 int encode_name(const char *qname, uint8_t *request) {
@@ -231,7 +248,7 @@ int decode_name(uint8_t *response, int offset, char *out) {
   int start_offset = offset;
 
   while (response[offset] != '\0') {
-    if ((response[offset] & DNS_PTR_MASK) == DNS_PTR_MASK) {
+    if ((response[offset] & DNS_POINTER_MASK) == DNS_POINTER_MASK) {
       int jump = ((response[offset] & 0x3F) << 8) | response[offset + 1];
       decode_name(response, jump, out);
       offset += 2;
@@ -246,22 +263,24 @@ int decode_name(uint8_t *response, int offset, char *out) {
   }
 
   *out = '\0';
-  offset++; // skip the \0 terminator
+  offset++; // skip the null terminator
   return offset - start_offset;
 }
 
 uint16_t str_to_type(const char *type) {
-  uint16_t result = 1; // defaults to "A"
-  if (strcmp(type, "NS") == 0) {
-    result = 2;
+  uint16_t result = 0; // unknown type
+  if (strcmp(type, "A") == 0) {
+    result = DNS_TYPE_A;
+  } else if (strcmp(type, "NS") == 0) {
+    result = DNS_TYPE_NS;
   } else if (strcmp(type, "CNAME") == 0) {
-    result = 5;
+    result = DNS_TYPE_CNAME;
   } else if (strcmp(type, "MX") == 0) {
-    result = 15;
+    result = DNS_TYPE_MX;
   } else if (strcmp(type, "TXT") == 0) {
-    result = 16;
+    result = DNS_TYPE_TXT;
   } else if (strcmp(type, "AAAA") == 0) {
-    result = 28;
+    result = DNS_TYPE_AAAA;
   }
   return result;
 }
@@ -288,7 +307,7 @@ char *type_to_str(uint16_t type) {
     result = "AAAA";
     break;
   default:
-    result = "A";
+    result = "UNKNOWN";
     break;
   }
   return result;
@@ -311,7 +330,7 @@ int build_request(const char *qname, const char *qtype, uint8_t *request) {
   uint8_t *start = request;
 
   dns_header header = {.id = htons(rand() % UINT16_MAX + 1),
-                       .flags = htons(0x0100), // literally just set recursion
+                       .flags = htons(DNS_FLAG_RD),
                        .qdcount = htons(1),
                        .ancount = htons(0),
                        .nscount = htons(0),
@@ -321,7 +340,6 @@ int build_request(const char *qname, const char *qtype, uint8_t *request) {
 
   int encoded_len = encode_name(qname, request);
   request += encoded_len;
-  // direct cast avoids the temp variable that memcpy would require
   *((uint16_t *)request) = htons(str_to_type(qtype));
   request += 2;
   *((uint16_t *)request) = htons(DNS_CLASS_IN);
@@ -330,39 +348,38 @@ int build_request(const char *qname, const char *qtype, uint8_t *request) {
   return request - start;
 }
 
-int send_request(uint8_t *request, int request_len, dns_args *args,
+int send_request(uint8_t *request, int request_len, dns_config *config,
                  uint8_t response[]) {
   int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (sock_fd < 0) {
     perror("socket");
-    return FAILURE;
+    return -1;
   }
 
   struct sockaddr_in server_addr;
-  int server_addr_len = sizeof(server_addr);
+  socklen_t server_addr_len = sizeof(server_addr);
   server_addr.sin_family = AF_INET;
   server_addr.sin_port = htons(DNS_PORT);
-  inet_aton(args->server_addr, &server_addr.sin_addr);
+  inet_aton(config->server_addr, &server_addr.sin_addr);
 
   struct sockaddr_in from_addr;
   socklen_t from_addr_len = sizeof(from_addr);
 
   // set timeout here
-  struct timeval time = {.tv_sec = args->timeout, .tv_usec = 0};
-  if (setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &time, sizeof(time)) ==
-      FAILURE) {
+  struct timeval time = {.tv_sec = config->timeout, .tv_usec = 0};
+  if (setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &time, sizeof(time)) == -1) {
     perror("setsockopt");
     close(sock_fd);
-    return FAILURE;
+    return -1;
   }
 
   int response_len = -1;
   int attempts = 0;
   do {
-    if (attempts >= args->retries) {
-      fprintf(stderr, "Error: timed out after %d retries\n", args->retries);
+    if (attempts >= config->retries) {
+      fprintf(stderr, "Error: timed out after %d retries\n", config->retries);
       close(sock_fd);
-      return FAILURE;
+      return -1;
     }
 
     int bytes_sent = sendto(sock_fd, request, request_len, 0,
@@ -370,12 +387,12 @@ int send_request(uint8_t *request, int request_len, dns_args *args,
     if (bytes_sent < 0) {
       perror("sendto");
       close(sock_fd);
-      return FAILURE;
+      return -1;
     }
 
     response_len = recvfrom(sock_fd, response, DNS_MAX_MESSAGE_SIZE, 0,
                             (struct sockaddr *)&from_addr, &from_addr_len);
-    if (response_len == FAILURE) {
+    if (response_len == -1) {
       perror("recvfrom");
     }
 
@@ -507,6 +524,7 @@ void print_message(dns_message *message) {
     for (int i = 0; i < message->header.ancount; i++) {
       print_record(&message->answers[i]);
     }
+    printf("\n");
   }
 
   if (message->header.nscount > 0) {
@@ -514,6 +532,7 @@ void print_message(dns_message *message) {
     for (int i = 0; i < message->header.nscount; i++) {
       print_record(&message->authority[i]);
     }
+    printf("\n");
   }
 
   if (message->header.arcount > 0) {
@@ -521,5 +540,6 @@ void print_message(dns_message *message) {
     for (int i = 0; i < message->header.arcount; i++) {
       print_record(&message->additional[i]);
     }
+    printf("\n");
   }
 }
