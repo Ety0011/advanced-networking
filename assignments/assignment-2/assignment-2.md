@@ -86,7 +86,7 @@ $$
 \begin{align*}
     N &= \lambda T \\
     N &= \frac{1}{5} \cdot 180 \\
-    N &= 36
+    N &= 36 \text{ patients}
 \end{align*}
 $$
 
@@ -149,7 +149,7 @@ $$
 \begin{align*}
     E[N] &= \frac{\rho}{1 - \rho} \\
     &= \frac{0.9}{1 - 0.9} \\
-    &= 9
+    &= 9 \text{ packets}
 \end{align*}
 $$
 
@@ -159,17 +159,28 @@ $$
 \begin{align*}
     E[N_Q] &= \frac{\rho^2}{1 - \rho} \\
     &= \frac{0.9^2}{1 - 0.9} \\
-    &= 8.1
+    &= 8.1 \text{ packets}
 \end{align*}
 $$
 
 ### c
 
+Mean waiting time in the system:
+
 $$
 \begin{align*}
-    N &= \lambda T \\
-    T &= \frac{N}{\lambda} \\
+    T &= \frac{E[N]}{\lambda} \\
     &= \frac{9}{450} \\
     &= 0.02 \text{ seconds}
+\end{align*}
+$$
+
+Mean waiting time in the queue:
+
+$$
+\begin{align*}
+    T &= \frac{E[N_Q]}{\lambda} \\
+    &= \frac{8.1}{450} \\
+    &= 0.018 \text{ seconds}
 \end{align*}
 $$
