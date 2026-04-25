@@ -5,7 +5,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Launch",
+      "name": "C: dnslookup",
       "type": "cppdbg",
       "request": "launch",
       "program": "${workspaceFolder}/out/build/clang/dnslookup",
@@ -19,7 +19,18 @@
       "environment": [],
       "externalConsole": false,
       "MIMode": "lldb",
-      // "preLaunchTask": "CMake: build"
+    },
+    {
+        "name": "Python: Current File",
+        "type": "python",
+        "request": "launch",
+        "program": "${file}",
+        "console": "integratedTerminal",
+        "cwd": "${fileDirname}",
+        "args": [
+            "--draw",
+            "topology.yaml"
+        ]
     }
   ]
 }

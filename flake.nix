@@ -50,6 +50,7 @@
                     ruff
                     pip
                     debugpy
+                    pyyaml
                   ]);
               };
         }
