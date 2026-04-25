@@ -1,5 +1,5 @@
 {
-  description = "A Nix-flake-based C/C++ development environment";
+  description = "A Nix-flake-based C/C++ and Python development environment";
 
   inputs.nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0";
 
@@ -7,9 +7,6 @@
     { self, ... }@inputs:
     let
       supportedSystems = [
-        "x86_64-linux"
-        "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
 
@@ -18,10 +15,23 @@
         inputs.nixpkgs.lib.genAttrs supportedSystems (
           system: f { pkgs = import inputs.nixpkgs { inherit system; }; }
         );
+
+      version = "3.13";
     in
     {
       devShells = forEachSupportedSystem (
         { pkgs }:
+        let
+          concatMajorMinor =
+            v:
+            pkgs.lib.pipe v [
+              pkgs.lib.versions.splitVersion
+              (pkgs.lib.sublist 0 2)
+              pkgs.lib.concatStrings
+            ];
+
+          python = pkgs."python${concatMajorMinor version}";
+        in
         {
           default =
             pkgs.mkShell.override
@@ -29,10 +39,18 @@
                 stdenv = pkgs.clangStdenv;
               }
               {
-                packages = with pkgs; [
-                  clang-tools
-                  cmake
-                ];
+                packages =
+                  with pkgs;
+                  [
+                    clang-tools
+                    cmake
+                  ]
+                  ++ (with python.pkgs; [
+                    python
+                    ruff
+                    pip
+                    debugpy
+                  ]);
               };
         }
       );
