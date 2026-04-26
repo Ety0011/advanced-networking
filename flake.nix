@@ -44,6 +44,9 @@
                   [
                     clang-tools
                     cmake
+                    colima
+                    docker
+                    docker-compose
                   ]
                   ++ (with python.pkgs; [
                     python
