@@ -66,7 +66,7 @@ def parse_command_line():
     return draw, args[index]
 
 
-def calculate_subnet_address(ip, mask):
+def get_subnet_address(ip, mask):
     ip_bytes = [int(x) for x in ip.split(".")]
     mask_bytes = [int(x) for x in mask.split(".")]
 
@@ -82,8 +82,8 @@ def get_subnets(topology):
 
     for category, nodes in topology.items():
         for node, interfaces in nodes.items():
-            for config in interfaces.values():
-                subnet_id = calculate_subnet_address(config["address"], config["mask"])
+            for interface, config in interfaces.items():
+                subnet_id = get_subnet_address(config["address"], config["mask"])
                 if subnet_id not in subnets:
                     subnets[subnet_id] = {
                         "routers": [],
@@ -105,51 +105,52 @@ def get_subnets(topology):
     return subnets
 
 
-def get_edges(subnets):
-    edges = set()
+def get_routers_graph(subnets):
+    graph = {}
 
     for subnet in subnets.values():
         routers = subnet["routers"]
-        hosts = subnet["hosts"]
-        switch = subnet["switch"]
         cost = subnet["cost"]
-        if len(hosts) == 0:  # only routers
-            routers_n = len(routers)
-            for i in range(routers_n):
-                for j in range(i + 1, routers_n):
-                    edge = (routers[i], routers[j], cost)
-                    edges.add(edge)
-        elif len(hosts) == 1:  # router is guaranteed here
-            edge = (routers[0], hosts[0], cost)
-            edges.add(edge)
-        else:  # hosts > 1 -> there is switch
-            all_nodes = routers + hosts
-            for node in all_nodes:
-                edge = (switch, node, cost)
-                edges.add(edge)
+        nodes = routers
+        nodes_n = len(nodes)
+        for i in range(nodes_n):
+            for j in range(nodes_n):
+                if i == j:
+                    continue
+                link = {"to": nodes[j], "cost": cost}
+                if nodes[i] not in graph:
+                    graph[nodes[i]] = []
+                graph[nodes[i]].append(link)
 
-    return edges
+    return graph
 
 
-def get_adjecency(edges):
-    adj = {}
+def floyd_warshall(graph):
+    nodes = sorted(graph.keys())
 
-    for node_a, node_b, cost in edges:
-        if node_a not in adj:
-            adj[node_a] = []
-        if node_b not in adj:
-            adj[node_b] = []
-        adj[node_a].append((node_b, cost))
-        adj[node_b].append((node_a, cost))
+    dist = {i: {j: float("inf") for j in nodes} for i in nodes}
+    next_hop = {i: {j: None for j in nodes} for i in nodes}
 
-    return adj
+    for u in nodes:
+        dist[u][u] = 0
+        for link in graph[u]:
+            v = link["to"]
+            cost = link["cost"]
+            dist[u][v] = cost
+            next_hop[u][v] = v
 
+    for k in nodes:
+        for i in nodes:
+            for j in nodes:
+                # Calculate the cost of the path through node k
+                path_through_k = dist[i][k] + dist[k][j]
 
-def parse_topology(topology):
-    subnets = get_subnets(topology)
-    edges = get_edges(subnets)
-    adj = get_adjecency(edges)
-    return adj, edges
+                # If passing through k is cheaper than the direct route
+                if dist[i][j] > path_through_k:
+                    dist[i][j] = path_through_k
+                    next_hop[i][j] = next_hop[i][k]
+
+    return dist, next_hop
 
 
 def main():
@@ -160,11 +161,15 @@ def main():
 
     with open(topology_path, "r") as file:
         topology = yaml.safe_load(file)
-    adj, edges = parse_topology(topology)
 
-    if draw:
-        print_routers(adj, edges)
-        sys.exit(0)
+    subnets = get_subnets(topology)
+    routers_graph = get_routers_graph(subnets)
+
+    print("h")
+
+    # if draw:
+    #     print_routers(adj, edges)
+    #     sys.exit(0)
 
 
 if __name__ == "__main__":
