@@ -182,10 +182,12 @@ def start_mininet(subnets, dist, next_hop):
         for node in nodes:
             node_name = node["name"]
             if node_name not in mini_nodes:
-                mini_nodes[node_name] = mininet.addHost(node_name)
+                mini_nodes[node_name] = mininet.addHost(node_name, ip=None)
         switch_name = subnet["switch"]
         if switch_name is not None and switch_name not in mini_nodes:
-            mini_nodes[switch_name] = mininet.addSwitch(switch_name)
+            mini_nodes[switch_name] = mininet.addSwitch(
+                switch_name, failMode="standalone"
+            )
 
     # wire up
     for subnet_address, subnet in subnets.items():
