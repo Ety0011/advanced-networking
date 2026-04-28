@@ -7,6 +7,8 @@ from mininet.log import setLogLevel
 from mininet.net import Mininet
 from mininet.node import OVSSwitch
 
+# Giovanni showed me some useful library functions
+
 
 def print_help():
     print(
@@ -65,7 +67,6 @@ def get_subnets(topology):
             for interface, config in interfaces.items():
                 address = config["address"]
                 mask = config["mask"]
-                # cool library function discovered from Giovanni Elisei
                 subnet_address = ipaddress.IPv4Network(
                     f"{address}/{mask}", strict=False
                 )
