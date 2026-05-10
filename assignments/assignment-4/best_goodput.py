@@ -6,9 +6,10 @@ import tempfile
 
 import yaml
 from mininet.cli import CLI
+from mininet.link import TCLink
 from mininet.log import setLogLevel
 from mininet.net import Mininet
-from mininet.node import OVSSwitch
+from mininet.node import Node, OVSSwitch
 
 
 def parse_command_line():
@@ -127,11 +128,8 @@ def host_to_router(host_name, topology, subnets):
     return subnets[subnet_address]["routers"][0]["name"]
 
 
-def build_lp(topology, subnets, graph):
-    lines = []
-    lines.append("Maximize")
-
-    demands = [
+def get_demands(topology, subnets):
+    return [
         {
             "src": host_to_router(demand["src"], topology, subnets),
             "dst": host_to_router(demand["dst"], topology, subnets),
@@ -139,6 +137,13 @@ def build_lp(topology, subnets, graph):
         }
         for demand in topology["demands"]
     ]
+
+
+def build_lp(topology, subnets, graph):
+    lines = []
+    lines.append("Maximize")
+
+    demands = get_demands(topology, subnets)
     lines.append(" obj: alpha")
 
     lines.append("Subject to")
@@ -226,93 +231,200 @@ def parse_solution(report):
     return values
 
 
-def start_mininet(subnets, dist, next_hop):
-    setLogLevel("info")
-    mininet = Mininet(topo=None, build=False, switch=OVSSwitch)
-    mini_nodes = {}
+def decompose_paths(graph, demands, solution):
+    decompositions = []
+    for i, demand in enumerate(demands):
+        src_r = demand["src"]
+        dst_r = demand["dst"]
 
-    # build
-    for subnet in subnets.values():
-        nodes = subnet["routers"] + subnet["hosts"]
-        for node in nodes:
-            node_name = node["name"]
-            if node_name not in mini_nodes:
-                mini_nodes[node_name] = mininet.addHost(node_name, ip=None)
-        switch_name = subnet["switch"]
-        if switch_name is not None and switch_name not in mini_nodes:
-            mini_nodes[switch_name] = mininet.addSwitch(
-                switch_name, failMode="standalone"
-            )
+        if src_r == dst_r:
+            g = solution.get(f"g{i}", 0.0)
+            decompositions.append([([src_r], g)])
+            continue
 
-    # wire up
-    for subnet_address, subnet in subnets.items():
-        nodes = subnet["routers"] + subnet["hosts"]
-        switch_name = subnet["switch"]
-        prefix = subnet_address.prefixlen
+        residual = {u: {} for u in graph}
+        for u in graph:
+            for edge in graph[u]:
+                v = edge["to"]
+                val = solution.get(f"f{i}_{u}_{v}", 0.0)
+                if val > 1e-6:
+                    residual[u][v] = val
 
-        if switch_name is None:  # exactly 2 nodes
-            src, dst = nodes[0], nodes[1]
-            mininet.addLink(
-                mini_nodes[src["name"]],
-                mini_nodes[dst["name"]],
-                intfName1=src["interface"],
-                intfName2=dst["interface"],
-                params1={"ip": f"{src['address']}/{prefix}"},
-                params2={"ip": f"{dst['address']}/{prefix}"},
-            )
-        else:  # (1 router, 1 switch, multiple hosts)
-            for src in nodes:
-                mininet.addLink(
-                    mini_nodes[src["name"]],
-                    mini_nodes[switch_name],
-                    intfName1=src["interface"],
-                    params1={"ip": f"{src['address']}/{prefix}"},
+        paths = []
+        while True:
+            parent = {src_r: None}
+            queue = [src_r]
+            while queue and dst_r not in parent:
+                nxt = []
+                for u in queue:
+                    for v, flow in residual[u].items():
+                        if flow > 1e-6 and v not in parent:
+                            parent[v] = u
+                            nxt.append(v)
+                queue = nxt
+
+            if dst_r not in parent:
+                break
+
+            path = [dst_r]
+            cur = dst_r
+            while cur != src_r:
+                cur = parent[cur]
+                path.append(cur)
+            path.reverse()
+
+            bottleneck = min(residual[path[k]][path[k + 1]] for k in range(len(path) - 1))
+            paths.append((path, bottleneck))
+
+            for k in range(len(path) - 1):
+                u, v = path[k], path[k + 1]
+                residual[u][v] -= bottleneck
+                if residual[u][v] <= 1e-6:
+                    del residual[u][v]
+
+        decompositions.append(paths)
+    return decompositions
+
+
+def install_mpls_rules(nodes, topology, subnets, graph, demands, decompositions):
+    iface_of = {}
+    for src, edges in graph.items():
+        for edge in edges:
+            iface_of[(src, edge["to"])] = (edge["interface"], edge["address"])
+
+    host_subnet = {}
+    for subnet_addr, subnet in subnets.items():
+        for host in subnet["hosts"]:
+            host_subnet[host["name"]] = subnet_addr
+
+    next_label = 100
+    aggregated = {}
+
+    for i, (demand_raw, paths) in enumerate(zip(topology["demands"], decompositions)):
+        dst_host = demand_raw["dst"]
+        dst_subnet = host_subnet[dst_host]
+        src_router = demands[i]["src"]
+
+        for path_nodes, rate in paths:
+            n_hops = len(path_nodes) - 1
+            if n_hops < 1:
+                continue
+
+            labels = list(range(next_label, next_label + n_hops))
+            next_label += n_hops
+            ifaces = [iface_of[(path_nodes[k], path_nodes[k + 1])] for k in range(n_hops)]
+
+            # transit routers: swap in-label to out-label
+            for k in range(1, n_hops):
+                router = path_nodes[k]
+                if_name, next_ip = ifaces[k]
+                nodes[router].cmd(
+                    f"ip -f mpls route add {labels[k - 1]} as {labels[k]} "
+                    f"via inet {next_ip} dev {if_name}"
                 )
 
-    mininet.start()
+            # egress: pop last label
+            nodes[path_nodes[-1]].cmd(f"ip -f mpls route add {labels[-1]} dev lo")
 
-    # add gateways
-    for subnet in subnets.values():
-        if not subnet["hosts"]:
-            continue
-        # every host is guaranteed to have one router
-        gateway_ip = subnet["routers"][0]["address"]
-        for host in subnet["hosts"]:
-            mini_host = mini_nodes[host["name"]]
-            mini_host.cmd(f"ip route add default via {gateway_ip}")
+            key = (src_router, dst_subnet)
+            aggregated.setdefault(key, []).append((rate, labels[0], ifaces[0]))
 
-    # add routing tables
-    # for each router, I need to find the closest router on each subnet
-    # and then forward next hop towards that router
-    router_names = set(next_hop.keys())
-    for src_name in router_names:
-        mini_nodes[src_name].cmd("sysctl -w net.ipv4.ip_forward=1")
-        for subnet_address, subnet in subnets.items():
-            # find closest router in subnet
-            best_name = None
-            best_dist = float("inf")
-            for dst in subnet["routers"]:
-                dst_name = dst["name"]
-                if src_name == dst_name:
-                    continue
-                dst_dist = dist[src_name][dst_name]
-                if dst_dist < best_dist:
-                    best_dist = dst_dist
-                    best_name = dst_name
-            # subnet is unreachable
-            if best_name is None:
-                continue
-            # set table entry
-            hop = next_hop[src_name][best_name]
-            mini_nodes[src_name].cmd(
-                f"ip route add {subnet_address} "
-                f"via {hop['address']} "
-                f"dev {hop['interface']}"
+    for (src_router, dst_subnet), entries in aggregated.items():
+        if len(entries) == 1:
+            _, first_label, (if_name, next_ip) = entries[0]
+            nodes[src_router].cmd(
+                f"ip route add {dst_subnet} encap mpls {first_label} "
+                f"via {next_ip} dev {if_name}"
             )
+        else:
+            weights = [max(1, int(round(rate * 100))) for rate, _, _ in entries]
+            cmd = f"ip route add {dst_subnet}"
+            for (_, first_label, (if_name, next_ip)), w in zip(entries, weights):
+                cmd += f" nexthop encap mpls {first_label} via {next_ip} dev {if_name} weight {w}"
+            nodes[src_router].cmd(cmd)
 
-    # run
-    CLI(mininet)
-    mininet.stop()
+
+def start_mininet(topology, subnets, graph, demands, decompositions):
+    class Router(Node):
+        def config(self, **params):
+            super().config(**params)
+            self.cmd("sysctl -w net.ipv4.ip_forward=1")
+            self.cmd("modprobe mpls_router 2>/dev/null")
+            self.cmd("modprobe mpls_iptunnel 2>/dev/null")
+            self.cmd("sysctl -w net.mpls.platform_labels=1048575")
+
+        def terminate(self):
+            self.cmd("sysctl -w net.ipv4.ip_forward=0")
+            super().terminate()
+
+    setLogLevel("info")
+    net = Mininet(switch=OVSSwitch, controller=None, link=TCLink)
+    nodes = {}
+
+    router_names = set(topology["routers"].keys())
+
+    # create nodes
+    for subnet in subnets.values():
+        for node in subnet["routers"] + subnet["hosts"]:
+            name = node["name"]
+            if name not in nodes:
+                if name in router_names:
+                    nodes[name] = net.addHost(name, cls=Router, ip=None)
+                else:
+                    nodes[name] = net.addHost(name, ip=None)
+
+    switch_id = 1
+
+    # wire up
+    for subnet_addr, subnet in subnets.items():
+        prefix = subnet_addr.prefixlen
+        routers = subnet["routers"]
+        hosts = subnet["hosts"]
+        all_nodes = routers + hosts
+
+        if subnet["switch"] is None and len(all_nodes) == 2:
+            a, b = all_nodes[0], all_nodes[1]
+            bw = subnet["cost"] if routers and len(routers) == 2 else None
+            kw = {"bw": bw} if bw else {}
+            net.addLink(
+                nodes[a["name"]], nodes[b["name"]],
+                intfName1=a["interface"], intfName2=b["interface"],
+                **kw,
+            )
+            nodes[a["name"]].setIP(f"{a['address']}/{prefix}", intf=a["interface"])
+            nodes[b["name"]].setIP(f"{b['address']}/{prefix}", intf=b["interface"])
+        else:
+            sw_name = f"s{switch_id}"
+            switch_id += 1
+            sw = net.addSwitch(sw_name, failMode="standalone")
+            switches[sw_name] = sw
+            for node in all_nodes:
+                net.addLink(nodes[node["name"]], sw, intfName1=node["interface"])
+                nodes[node["name"]].setIP(
+                    f"{node['address']}/{prefix}", intf=node["interface"]
+                )
+
+    net.build()
+    net.start()
+
+    # enable MPLS input on all router interfaces
+    for r_name in router_names:
+        for intf in nodes[r_name].intfList():
+            if intf.name != "lo":
+                nodes[r_name].cmd(f"sysctl -w net.mpls.conf.{intf.name}.input=1")
+
+    # host default gateways
+    for subnet in subnets.values():
+        if not subnet["hosts"] or not subnet["routers"]:
+            continue
+        gw_ip = subnet["routers"][0]["address"]
+        for host in subnet["hosts"]:
+            nodes[host["name"]].cmd(f"ip route add default via {gw_ip}")
+
+    install_mpls_rules(nodes, topology, subnets, graph, demands, decompositions)
+
+    CLI(net)
+    net.stop()
 
 
 def main():
@@ -343,7 +455,9 @@ def main():
             print(f"The best goodput for flow demand #{i + 1} is {g_str} Mbps")
         return
 
-    # otherwise run mininet
+    demands = get_demands(topology, subnets)
+    decompositions = decompose_paths(graph, demands, solution)
+    start_mininet(topology, subnets, graph, demands, decompositions)
 
 
 if __name__ == "__main__":
