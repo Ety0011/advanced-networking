@@ -1,5 +1,5 @@
+import argparse
 import ipaddress
-import sys
 
 import yaml
 from mininet.cli import CLI
@@ -7,63 +7,37 @@ from mininet.log import setLogLevel
 from mininet.net import Mininet
 from mininet.node import OVSSwitch
 
-# Giovanni showed me some useful library functions
-
-
-def print_help():
-    print(
-        "usage: emulation.py [-h] [-d] definition\n\n"
-        "A tool to define the emulation of a network.\n\n"
-        "positional arguments:\n"
-        "  definition the definition file of the network in YAML\n\n"
-        "options:\n"
-        "  -h, --help show this help message and exit\n"
-        "  -d, --draw output a map of the routers in GraphViz format\n"
-    )
-
 
 def parse_command_line():
-    args = sys.argv
-    args_count = len(args)
-    min_args = 2
-    max_args = 3
-
-    if args_count < min_args:
-        print("Error: No arguments provided.")
-        return None
-
-    if args_count > max_args:
-        print("Error: Too many arguments provided.")
-        return None
-
-    index = 1
-    draw = False
-
-    while index < args_count:
-        arg = args[index]
-
-        if arg in ("-h", "--help"):
-            print_help()
-            return None
-        elif arg in ("-d", "--draw"):
-            draw = True
-        else:
-            break
-
-        index += 1
-
-    if index != args_count - 1:
-        print("Error: Expected a definition file as the last argument.")
-        return None
-
-    return draw, args[index]
+    parser = argparse.ArgumentParser(
+        description=(
+            "A tool to define the emulation of a network configured to achieve "
+            "the best overall goodput under a given set of flow demands."
+        )
+    )
+    parser.add_argument(
+        "-p",
+        "--print",
+        action="store_true",
+        help="print the optimal goodput for each flow and exit",
+    )
+    parser.add_argument(
+        "-l",
+        "--lp",
+        action="store_true",
+        help="print the definition of the optimization problem in CPLEX LP format",
+    )
+    parser.add_argument(
+        "definition", help="the definition file of the network and flow demands in YAML"
+    )
+    return parser.parse_args()
 
 
 def get_subnets(topology):
     subnets = {}
 
-    for category, nodes in topology.items():
-        for name, interfaces in nodes.items():
+    for category in ("routers", "hosts"):
+        for name, interfaces in topology[category].items():
             for interface, config in interfaces.items():
                 address = config["address"]
                 mask = config["mask"]
@@ -142,34 +116,74 @@ def get_graph(subnets):
     return graph
 
 
-def floyd_warshall(graph):
-    names = sorted(graph.keys())
+def host_to_router(host_name, topology, subnets):
+    host_config = topology["hosts"][host_name]["eth0"]
+    address = host_config["address"]
+    mask = host_config["mask"]
+    subnet_address = ipaddress.IPv4Network(f"{address}/{mask}", strict=False)
+    return subnets[subnet_address]["routers"][0]["name"]
 
-    dist = {i: {j: float("inf") for j in names} for i in names}
-    next_hop = {i: {j: None for j in names} for i in names}
 
-    for u in names:
-        dist[u][u] = 0
-        for link in graph[u]:
-            v = link["to"]
-            cost = link["cost"]
-            # there can be multiple links
-            if cost < dist[u][v]:
-                dist[u][v] = cost
-                next_hop[u][v] = {
-                    "address": link["address"],
-                    "interface": link["interface"],
-                }
+def print_lp_definition(topology, subnets, graph):
+    print("Maximize")
 
-    for k in names:
-        for i in names:
-            for j in names:
-                dist_through_k = dist[i][k] + dist[k][j]
-                if dist[i][j] > dist_through_k:
-                    dist[i][j] = dist_through_k
-                    next_hop[i][j] = next_hop[i][k]
+    demands = [
+        {
+            "src": host_to_router(demand["src"], topology, subnets),
+            "dst": host_to_router(demand["dst"], topology, subnets),
+            "rate": demand["rate"],
+        }
+        for demand in topology["demands"]
+    ]
+    print("obj: alpha")
 
-    return dist, next_hop
+    print("Subject to")
+    incoming_names = {r: [] for r in graph}
+    for src, edges in graph.items():
+        for edge in edges:
+            incoming_names[edge["to"]].append(src)
+    router_names = graph.keys()
+    for i, demand in enumerate(demands):
+        # flow conservation
+        for src_name in router_names:
+            # src -> outgoing - ingoing = goodput
+            # dst -> outgoing - ingoing = -goodput
+            # intermediate -> outgoing - ingoing = 0
+            outgoing = [f"f{i}_{src_name}_{dst['to']}" for dst in graph[src_name]]
+            ingoing = [
+                f"f{i}_{dst_name}_{src_name}" for dst_name in incoming_names[src_name]
+            ]
+            if src_name == demand["src"]:
+                ingoing.append(f"g{i}")
+            elif src_name == demand["dst"]:
+                outgoing.append(f"g{i}")
+            pos = " + ".join(outgoing)
+            neg = " - ".join(ingoing)
+            constraint = (pos + " - " + neg if neg else pos) + " = 0"
+            print(constraint)
+        print()
+
+        # demand, thank god its just one source for demand
+        print(f"g{i} <= {demand['rate']}")
+
+        # effectiveness
+        print(f"g{i} - {demand['rate']} alpha >= 0")
+
+    # capacity
+    for src, edges in graph.items():
+        for edge in edges:
+            flows = []
+            for i in range(len(demands)):
+                flows.append(f"f{i}_{src}_{edge['to']}")
+            capacity = " + ".join(flows) + f" <= {edge['cost']}"
+            print(capacity)
+
+    # bounds
+    print("Bounds")
+    print("0 <= alpha <= 1")
+
+    # end
+    print("End")
 
 
 def start_mininet(subnets, dist, next_hop):
@@ -262,24 +276,24 @@ def start_mininet(subnets, dist, next_hop):
 
 
 def main():
-    result = parse_command_line()
-    if result is None:
-        sys.exit(1)
-    draw, topology_path = result
+    args = parse_command_line()
+    do_print = args.print
+    do_lp = args.lp
+    topology_path = args.definition
 
-    with open(topology_path, "r") as file:
+    with open(topology_path) as file:
         topology = yaml.safe_load(file)
 
     subnets = get_subnets(topology)
-
-    if draw:
-        print_graphviz(subnets)
-        sys.exit(0)
-
     graph = get_graph(subnets)
-    dist, next_hop = floyd_warshall(graph)
 
-    start_mininet(subnets, dist, next_hop)
+    # do_lp -> just print lp definition
+    if do_lp:
+        print_lp_definition(topology, subnets, graph)
+
+    # do_print -> run solver
+
+    # otherwise run mininet
 
 
 if __name__ == "__main__":
