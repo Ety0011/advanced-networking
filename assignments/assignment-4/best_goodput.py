@@ -1,5 +1,8 @@
 import argparse
 import ipaddress
+import os
+import subprocess
+import tempfile
 
 import yaml
 from mininet.cli import CLI
@@ -124,8 +127,9 @@ def host_to_router(host_name, topology, subnets):
     return subnets[subnet_address]["routers"][0]["name"]
 
 
-def print_lp_definition(topology, subnets, graph):
-    print("Maximize")
+def build_lp(topology, subnets, graph):
+    lines = []
+    lines.append("Maximize")
 
     demands = [
         {
@@ -135,55 +139,91 @@ def print_lp_definition(topology, subnets, graph):
         }
         for demand in topology["demands"]
     ]
-    print("obj: alpha")
+    lines.append(" obj: alpha")
 
-    print("Subject to")
-    incoming_names = {r: [] for r in graph}
-    for src, edges in graph.items():
-        for edge in edges:
-            incoming_names[edge["to"]].append(src)
+    lines.append("Subject to")
     router_names = graph.keys()
     for i, demand in enumerate(demands):
         # flow conservation
         for src_name in router_names:
-            # src -> outgoing - ingoing = goodput
-            # dst -> outgoing - ingoing = -goodput
-            # intermediate -> outgoing - ingoing = 0
-            outgoing = [f"f{i}_{src_name}_{dst['to']}" for dst in graph[src_name]]
-            ingoing = [
-                f"f{i}_{dst_name}_{src_name}" for dst_name in incoming_names[src_name]
-            ]
+            outgoing = []
+            ingoing = []
+            for dst in graph[src_name]:
+                outgoing.append(f"f{i}_{src_name}_{dst['to']}")
+                ingoing.append(f"f{i}_{dst['to']}_{src_name}")
             if src_name == demand["src"]:
                 ingoing.append(f"g{i}")
             elif src_name == demand["dst"]:
                 outgoing.append(f"g{i}")
             pos = " + ".join(outgoing)
             neg = " - ".join(ingoing)
-            constraint = (pos + " - " + neg if neg else pos) + " = 0"
-            print(constraint)
-        print()
+            lines.append(" " + (pos + " - " + neg if neg else pos) + " = 0")
+        lines.append("")
 
-        # demand, thank god its just one source for demand
-        print(f"g{i} <= {demand['rate']}")
-
-        # effectiveness
-        print(f"g{i} - {demand['rate']} alpha >= 0")
+        lines.append(f" g{i} <= {demand['rate']}")
+        lines.append(f" g{i} - {demand['rate']} alpha >= 0")
 
     # capacity
     for src, edges in graph.items():
         for edge in edges:
-            flows = []
-            for i in range(len(demands)):
-                flows.append(f"f{i}_{src}_{edge['to']}")
-            capacity = " + ".join(flows) + f" <= {edge['cost']}"
-            print(capacity)
+            flows = [f"f{i}_{src}_{edge['to']}" for i in range(len(demands))]
+            lines.append(" " + " + ".join(flows) + f" <= {edge['cost']}")
 
-    # bounds
-    print("Bounds")
-    print("0 <= alpha <= 1")
+    lines.append("Bounds")
+    lines.append(" 0 <= alpha <= 1")
+    lines.append("End")
 
-    # end
-    print("End")
+    return "\n".join(lines)
+
+
+def solve_lp(lp_text):
+    with tempfile.TemporaryDirectory() as tmp:
+        lp_path = os.path.join(tmp, "problem.lp")
+        sol_path = os.path.join(tmp, "problem.sol")
+
+        with open(lp_path, "w") as f:
+            f.write(lp_text)
+
+        result = subprocess.run(
+            ["glpsol", "--lp", lp_path, "-o", sol_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"glpsol failed:\n{result.stdout}\n{result.stderr}")
+
+        with open(sol_path) as f:
+            report = f.read()
+
+    return parse_solution(report)
+
+
+def parse_solution(report):
+    values = {}
+    in_columns = False
+    past_header = False
+    for line in report.splitlines():
+        if "Column name" in line:
+            in_columns = True
+            past_header = False
+            continue
+        if not in_columns:
+            continue
+        if line.strip().startswith("------"):
+            past_header = True
+            continue
+        if not past_header:
+            continue
+        if not line.strip():
+            break
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            values[parts[1]] = float(parts[3])
+        except ValueError:
+            continue
+    return values
 
 
 def start_mininet(subnets, dist, next_hop):
@@ -288,10 +328,20 @@ def main():
     graph = get_graph(subnets)
 
     # do_lp -> just print lp definition
-    if do_lp:
-        print_lp_definition(topology, subnets, graph)
+    lp = build_lp(topology, subnets, graph)
 
-    # do_print -> run solver
+    if do_lp:
+        print(lp)
+        return
+
+    solution = solve_lp(lp)
+
+    if do_print:
+        for i, _ in enumerate(topology["demands"]):
+            g = solution.get(f"g{i}", 0.0)
+            g_str = str(int(round(g))) if abs(g - round(g)) < 1e-6 else f"{g:.4g}"
+            print(f"The best goodput for flow demand #{i + 1} is {g_str} Mbps")
+        return
 
     # otherwise run mininet
 

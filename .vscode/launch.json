@@ -28,7 +28,7 @@
         "console": "integratedTerminal",
         "cwd": "${fileDirname}",
         "args": [
-            "--draw",
+            "-p",
             "topology.yaml"
         ]
     }
