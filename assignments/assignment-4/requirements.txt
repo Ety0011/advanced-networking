@@ -1,0 +1,4 @@
+mininet==2.3.0.dev6
+PyYAML==6.0.1
+ortools==9.9.3963
+setuptools==69.2.0

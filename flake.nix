@@ -54,6 +54,7 @@
                     pip
                     debugpy
                     pyyaml
+                    mininet
                   ]);
               };
         }
