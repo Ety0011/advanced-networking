@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y \
     sudo \
     nano \
     vim \
+    glpk-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies with eventlet version that has ALREADY_HANDLED
