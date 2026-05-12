@@ -140,45 +140,148 @@ def get_demands(topology, subnets):
 
 
 def build_lp(topology, subnets, graph):
-    lines = []
-    lines.append("Maximize")
-
+    lines = ["Maximize"]
     demands = get_demands(topology, subnets)
-    lines.append(" obj: alpha")
+
+    obj_terms = ["1000 alpha"]
+    for i in range(len(demands)):
+        obj_terms.append(f"g{i}")
+    lines.append(" obj: " + " + ".join(obj_terms))
 
     lines.append("Subject to")
-    router_names = graph.keys()
+    router_names = sorted(graph.keys())
+
+    unique_links = []
+    processed = set()
+    for u in router_names:
+        for edge in graph[u]:
+            v = edge["to"]
+            pair = tuple(sorted((u, v)))
+            if pair not in processed:
+                unique_links.append(pair)
+                processed.add(pair)
+
     for i, demand in enumerate(demands):
-        # flow conservation
-        for src_name in router_names:
-            outgoing = []
-            ingoing = []
-            for dst in graph[src_name]:
-                outgoing.append(f"f{i}_{src_name}_{dst['to']}")
-                ingoing.append(f"f{i}_{dst['to']}_{src_name}")
-            if src_name == demand["src"]:
-                ingoing.append(f"g{i}")
-            elif src_name == demand["dst"]:
-                outgoing.append(f"g{i}")
-            pos = " + ".join(outgoing)
-            neg = " - ".join(ingoing)
-            lines.append(" " + (pos + " - " + neg if neg else pos) + " = 0")
+        for node in router_names:
+            terms = []
+            for u in router_names:
+                for edge in graph[u]:
+                    v = edge["to"]
+                    if u == node:
+                        terms.append(f"- x{i}_{u}_{v}")
+                    if v == node:
+                        terms.append(f"+ x{i}_{u}_{v}")
+
+            rhs = 0
+            if node == demand["src"]:
+                rhs = -1
+            elif node == demand["dst"]:
+                rhs = 1
+
+            expr = " ".join(terms).strip()
+            if expr.startswith("+ "):
+                expr = expr[2:]
+            if expr:
+                lines.append(f" ind_bal_{i}_{node}: {expr} = {rhs}")
+
+        for node in router_names:
+            terms = []
+            for u in router_names:
+                for edge in graph[u]:
+                    v = edge["to"]
+                    if u == node:
+                        terms.append(f"- f{i}_{u}_{v}")
+                    if v == node:
+                        terms.append(f"+ f{i}_{u}_{v}")
+
+            if node == demand["src"]:
+                terms.append(f"+ g{i}")
+            elif node == demand["dst"]:
+                terms.append(f"- g{i}")
+
+            expr = " ".join(terms).strip()
+            if expr.startswith("+ "):
+                expr = expr[2:]
+            if expr:
+                lines.append(f" rate_bal_{i}_{node}: {expr} = 0")
+
+        for node in router_names:
+            in_vars = [
+                f"x{i}_{u}_{node}"
+                for u in router_names
+                for e in graph[u]
+                if e["to"] == node
+            ]
+            out_vars = [f"x{i}_{node}_{v}" for v in [e["to"] for e in graph[node]]]
+            if in_vars:
+                lines.append(f" in_excl_{i}_{node}: " + " + ".join(in_vars) + " <= 1")
+            if out_vars:
+                lines.append(f" out_excl_{i}_{node}: " + " + ".join(out_vars) + " <= 1")
+
+        for u in router_names:
+            for edge in graph[u]:
+                v = edge["to"]
+                cost = edge.get("cost", 1)
+                lines.append(
+                    f" couple_{i}_{u}_{v}: f{i}_{u}_{v} - {cost} x{i}_{u}_{v} <= 0"
+                )
+
+        lines.append(f" g_cap_{i}: g{i} <= {demand['rate']}")
+        lines.append(f" g_eff_{i}: g{i} - {demand['rate']} alpha >= 0")
         lines.append("")
 
-        lines.append(f" g{i} <= {demand['rate']}")
-        lines.append(f" g{i} - {demand['rate']} alpha >= 0")
+    for u, v in unique_links:
+        cost = 1
+        for edge in graph[u]:
+            if edge["to"] == v:
+                cost = edge.get("cost", 1)
+                break
 
-    # capacity
-    for src, edges in graph.items():
-        for edge in edges:
-            flows = [f"f{i}_{src}_{edge['to']}" for i in range(len(demands))]
-            lines.append(" " + " + ".join(flows) + f" <= {edge['cost']}")
+        link_rates = []
+        for i in range(len(demands)):
+            link_rates.append(f"f{i}_{u}_{v}")
+            link_rates.append(f"f{i}_{v}_{u}")
+        lines.append(f" cap_{u}_{v}: " + " + ".join(link_rates) + f" <= {cost}")
 
     lines.append("Bounds")
     lines.append(" 0 <= alpha <= 1")
+    lines.append("Binary")
+    for i in range(len(demands)):
+        for u in router_names:
+            for edge in graph[u]:
+                lines.append(f" x{i}_{u}_{edge['to']}")
     lines.append("End")
-
     return "\n".join(lines)
+
+
+def parse_solution(report):
+    values = {}
+    in_columns = False
+    past_header = False
+    for line in report.splitlines():
+        if "No. Column name" in line:
+            in_columns = True
+            continue
+        if not in_columns:
+            continue
+        if line.strip().startswith("------"):
+            past_header = True
+            continue
+        if not past_header:
+            continue
+        if not line.strip():
+            break
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            if parts[2] == "*":
+                values[parts[1]] = float(parts[3])
+            else:
+                values[parts[1]] = float(parts[2])
+        except ValueError:
+            continue
+    return values
 
 
 def solve_lp(lp_text):
@@ -201,34 +304,6 @@ def solve_lp(lp_text):
             report = f.read()
 
     return parse_solution(report)
-
-
-def parse_solution(report):
-    values = {}
-    in_columns = False
-    past_header = False
-    for line in report.splitlines():
-        if "Column name" in line:
-            in_columns = True
-            past_header = False
-            continue
-        if not in_columns:
-            continue
-        if line.strip().startswith("------"):
-            past_header = True
-            continue
-        if not past_header:
-            continue
-        if not line.strip():
-            break
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        try:
-            values[parts[1]] = float(parts[3])
-        except ValueError:
-            continue
-    return values
 
 
 def decompose_paths(graph, demands, solution):
@@ -273,7 +348,9 @@ def decompose_paths(graph, demands, solution):
                 path.append(cur)
             path.reverse()
 
-            bottleneck = min(residual[path[k]][path[k + 1]] for k in range(len(path) - 1))
+            bottleneck = min(
+                residual[path[k]][path[k + 1]] for k in range(len(path) - 1)
+            )
             paths.append((path, bottleneck))
 
             for k in range(len(path) - 1):
@@ -312,7 +389,9 @@ def install_mpls_rules(nodes, topology, subnets, graph, demands, decompositions)
 
             labels = list(range(next_label, next_label + n_hops))
             next_label += n_hops
-            ifaces = [iface_of[(path_nodes[k], path_nodes[k + 1])] for k in range(n_hops)]
+            ifaces = [
+                iface_of[(path_nodes[k], path_nodes[k + 1])] for k in range(n_hops)
+            ]
 
             # transit routers: swap in-label to out-label
             for k in range(1, n_hops):
@@ -387,8 +466,10 @@ def start_mininet(topology, subnets, graph, demands, decompositions):
             bw = subnet["cost"] if routers and len(routers) == 2 else None
             kw = {"bw": bw} if bw else {}
             net.addLink(
-                nodes[a["name"]], nodes[b["name"]],
-                intfName1=a["interface"], intfName2=b["interface"],
+                nodes[a["name"]],
+                nodes[b["name"]],
+                intfName1=a["interface"],
+                intfName2=b["interface"],
                 **kw,
             )
             nodes[a["name"]].setIP(f"{a['address']}/{prefix}", intf=a["interface"])
@@ -397,7 +478,6 @@ def start_mininet(topology, subnets, graph, demands, decompositions):
             sw_name = f"s{switch_id}"
             switch_id += 1
             sw = net.addSwitch(sw_name, failMode="standalone")
-            switches[sw_name] = sw
             for node in all_nodes:
                 net.addLink(nodes[node["name"]], sw, intfName1=node["interface"])
                 nodes[node["name"]].setIP(
