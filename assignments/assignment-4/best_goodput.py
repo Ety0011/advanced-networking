@@ -143,7 +143,10 @@ def build_lp(topology, subnets, graph):
     lines = ["Maximize"]
     demands = get_demands(topology, subnets)
 
-    obj_terms = ["1000 alpha"]
+    # We add g_i terms to force the solver to maximize every flow's throughput
+    # once best alpha ratio is met. This ensures any remaining capacity is used,
+    # preventing the solver from being indifferent to non-bottlenecked flows.
+    obj_terms = ["alpha"]
     for i in range(len(demands)):
         obj_terms.append(f"g{i}")
     lines.append(" obj: " + " + ".join(obj_terms))
@@ -363,6 +366,28 @@ def decompose_paths(graph, demands, solution):
     return decompositions
 
 
+def install_base_routing(nodes, subnets, graph):
+    """Ensures IP reachability for all subnets so pingall succeeds."""
+    router_names = list(graph.keys())
+    for net_obj, info in subnets.items():
+        if not info["routers"]:
+            continue
+        dst_router = info["routers"][0]["name"]
+        dist, queue = {dst_router: (None, None)}, [dst_router]
+        while queue:
+            curr = queue.pop(0)
+            for u in router_names:
+                for e in graph[u]:
+                    if e["to"] == curr and u not in dist:
+                        dist[u] = (e["interface"], e["address"])
+                        queue.append(u)
+        for r in router_names:
+            if r != dst_router and r in dist:
+                nodes[r].cmd(
+                    f"ip route add {net_obj} via {dist[r][1]} dev {dist[r][0]}"
+                )
+
+
 def install_mpls_rules(nodes, topology, subnets, graph, demands, decompositions):
     iface_of = {}
     for src, edges in graph.items():
@@ -412,12 +437,12 @@ def install_mpls_rules(nodes, topology, subnets, graph, demands, decompositions)
         if len(entries) == 1:
             _, first_label, (if_name, next_ip) = entries[0]
             nodes[src_router].cmd(
-                f"ip route add {dst_subnet} encap mpls {first_label} "
+                f"ip route replace {dst_subnet} encap mpls {first_label} "
                 f"via {next_ip} dev {if_name}"
             )
         else:
             weights = [max(1, int(round(rate * 100))) for rate, _, _ in entries]
-            cmd = f"ip route add {dst_subnet}"
+            cmd = f"ip route replace {dst_subnet}"
             for (_, first_label, (if_name, next_ip)), w in zip(entries, weights):
                 cmd += f" nexthop encap mpls {first_label} via {next_ip} dev {if_name} weight {w}"
             nodes[src_router].cmd(cmd)
@@ -431,6 +456,7 @@ def start_mininet(topology, subnets, graph, demands, decompositions):
             self.cmd("modprobe mpls_router 2>/dev/null")
             self.cmd("modprobe mpls_iptunnel 2>/dev/null")
             self.cmd("sysctl -w net.mpls.platform_labels=1048575")
+            self.cmd("sysctl -w net.mpls.conf.lo.input=1")
 
         def terminate(self):
             self.cmd("sysctl -w net.ipv4.ip_forward=0")
@@ -501,6 +527,9 @@ def start_mininet(topology, subnets, graph, demands, decompositions):
         for host in subnet["hosts"]:
             nodes[host["name"]].cmd(f"ip route add default via {gw_ip}")
 
+    # Step 1: Base routing for pingall
+    install_base_routing(nodes, subnets, graph)
+    # Step 2: Specialized MPLS optimization
     install_mpls_rules(nodes, topology, subnets, graph, demands, decompositions)
 
     CLI(net)
@@ -531,8 +560,8 @@ def main():
     if do_print:
         for i, _ in enumerate(topology["demands"]):
             g = solution.get(f"g{i}", 0.0)
-            g_str = str(int(round(g))) if abs(g - round(g)) < 1e-6 else f"{g:.4g}"
-            print(f"The best goodput for flow demand #{i + 1} is {g_str} Mbps")
+            # Rounded for integer display
+            print(f"The best goodput for flow demand #{i + 1} is {g} Mbps")
         return
 
     demands = get_demands(topology, subnets)
