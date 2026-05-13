@@ -88,8 +88,8 @@ def print_graphviz(subnets):
                 edges.add(edge)
 
     print("graph Network {")
-    for name in sorted(names):
-        print(f"    {name} [shape=circle];")
+    for r_name in sorted(names):
+        print(f"    {r_name} [shape=circle];")
     for edge in sorted(edges):
         print(f'    {edge[0]} -- {edge[1]} [label="{edge[2]}"];')
     print("}")
@@ -143,107 +143,105 @@ def build_lp(topology, subnets, graph):
     lines = ["Maximize"]
     demands = get_demands(topology, subnets)
 
-    # We add g_i terms to force the solver to maximize every flow's throughput
-    # once best alpha ratio is met. This ensures any remaining capacity is used,
-    # preventing the solver from being indifferent to non-bottlenecked flows.
-    obj_terms = ["alpha"]
-    for i in range(len(demands)):
-        obj_terms.append(f"g{i}")
+    # small weight on g_i to fill remaining capacity once alpha is maximized
+    obj_terms = ["alpha"] + [f"0.001 g{i}" for i in range(len(demands))]
     lines.append(" obj: " + " + ".join(obj_terms))
 
     lines.append("Subject to")
     router_names = sorted(graph.keys())
 
     unique_links = []
-    processed = set()
+    seen = set()
     for u in router_names:
         for edge in graph[u]:
             v = edge["to"]
             pair = tuple(sorted((u, v)))
-            if pair not in processed:
+            if pair not in seen:
                 unique_links.append(pair)
-                processed.add(pair)
+                seen.add(pair)
 
     for i, demand in enumerate(demands):
-        for node in router_names:
+        # flow conservation for binary path indicator x: -1 at src, +1 at dst
+        for r_name in router_names:
             terms = []
             for u in router_names:
                 for edge in graph[u]:
                     v = edge["to"]
-                    if u == node:
+                    if u == r_name:
                         terms.append(f"- x{i}_{u}_{v}")
-                    if v == node:
+                    if v == r_name:
                         terms.append(f"+ x{i}_{u}_{v}")
 
             rhs = 0
-            if node == demand["src"]:
+            if r_name == demand["src"]:
                 rhs = -1
-            elif node == demand["dst"]:
+            elif r_name == demand["dst"]:
                 rhs = 1
 
             expr = " ".join(terms).strip()
             if expr.startswith("+ "):
                 expr = expr[2:]
             if expr:
-                lines.append(f" ind_bal_{i}_{node}: {expr} = {rhs}")
+                lines.append(f" ind_bal_{i}_{r_name}: {expr} = {rhs}")
 
-        for node in router_names:
+        # flow rate conservation for f; g_i is added at src and removed at dst
+        for r_name in router_names:
             terms = []
             for u in router_names:
                 for edge in graph[u]:
                     v = edge["to"]
-                    if u == node:
+                    if u == r_name:
                         terms.append(f"- f{i}_{u}_{v}")
-                    if v == node:
+                    if v == r_name:
                         terms.append(f"+ f{i}_{u}_{v}")
 
-            if node == demand["src"]:
+            if r_name == demand["src"]:
                 terms.append(f"+ g{i}")
-            elif node == demand["dst"]:
+            elif r_name == demand["dst"]:
                 terms.append(f"- g{i}")
 
             expr = " ".join(terms).strip()
             if expr.startswith("+ "):
                 expr = expr[2:]
             if expr:
-                lines.append(f" rate_bal_{i}_{node}: {expr} = 0")
+                lines.append(f" rate_bal_{i}_{r_name}: {expr} = 0")
 
-        for node in router_names:
+        # single-path: at most one incoming and one outgoing edge per flow per node
+        for r_name in router_names:
             in_vars = [
-                f"x{i}_{u}_{node}"
+                f"x{i}_{u}_{r_name}"
                 for u in router_names
                 for e in graph[u]
-                if e["to"] == node
+                if e["to"] == r_name
             ]
-            out_vars = [f"x{i}_{node}_{v}" for v in [e["to"] for e in graph[node]]]
+            out_vars = [f"x{i}_{r_name}_{e['to']}" for e in graph[r_name]]
             if in_vars:
-                lines.append(f" in_excl_{i}_{node}: " + " + ".join(in_vars) + " <= 1")
+                lines.append(f" in_excl_{i}_{r_name}: " + " + ".join(in_vars) + " <= 1")
             if out_vars:
-                lines.append(f" out_excl_{i}_{node}: " + " + ".join(out_vars) + " <= 1")
+                lines.append(
+                    f" out_excl_{i}_{r_name}: " + " + ".join(out_vars) + " <= 1"
+                )
 
+        # f can only be nonzero on edges selected by x
         for u in router_names:
             for edge in graph[u]:
                 v = edge["to"]
-                cost = edge.get("cost", 1)
+                cost = edge["cost"]
                 lines.append(
                     f" couple_{i}_{u}_{v}: f{i}_{u}_{v} - {cost} x{i}_{u}_{v} <= 0"
                 )
 
         lines.append(f" g_cap_{i}: g{i} <= {demand['rate']}")
+        # g_i >= alpha * r_i enforces alpha as the min effectiveness ratio
         lines.append(f" g_eff_{i}: g{i} - {demand['rate']} alpha >= 0")
         lines.append("")
 
+    # both directions share the same physical link capacity
     for u, v in unique_links:
-        cost = 1
-        for edge in graph[u]:
-            if edge["to"] == v:
-                cost = edge.get("cost", 1)
-                break
-
-        link_rates = []
-        for i in range(len(demands)):
-            link_rates.append(f"f{i}_{u}_{v}")
-            link_rates.append(f"f{i}_{v}_{u}")
+        cost = next(e["cost"] for e in graph[u] if e["to"] == v)
+        link_rates = [
+            f"f{i}_{a}_{b}" for i in range(len(demands)) for a, b in ((u, v), (v, u))
+        ]
         lines.append(f" cap_{u}_{v}: " + " + ".join(link_rates) + f" <= {cost}")
 
     lines.append("Bounds")
@@ -278,6 +276,7 @@ def parse_solution(report):
         if len(parts) < 3:
             continue
         try:
+            # GLPK marks basic variables with '*'; value is then in column 4
             if parts[2] == "*":
                 values[parts[1]] = float(parts[3])
             else:
@@ -312,41 +311,43 @@ def solve_lp(lp_text):
 def decompose_paths(graph, demands, solution):
     decompositions = []
     for i, demand in enumerate(demands):
-        src_r = demand["src"]
-        dst_r = demand["dst"]
+        src = demand["src"]
+        dst = demand["dst"]
 
-        if src_r == dst_r:
+        if src == dst:
             g = solution.get(f"g{i}", 0.0)
-            decompositions.append([([src_r], g)])
+            decompositions.append([([src], g)])
             continue
 
         residual = {u: {} for u in graph}
         for u in graph:
             for edge in graph[u]:
                 v = edge["to"]
-                val = solution.get(f"f{i}_{u}_{v}", 0.0)
-                if val > 1e-6:
-                    residual[u][v] = val
+                flow = solution.get(f"f{i}_{u}_{v}", 0.0)
+                if flow > 1e-6:
+                    residual[u][v] = flow
 
+        # flow decomposition: repeatedly find a path via BFS, record its bottleneck
+        # rate, subtract from residual, until no flow remains
         paths = []
         while True:
-            parent = {src_r: None}
-            queue = [src_r]
-            while queue and dst_r not in parent:
-                nxt = []
+            parent = {src: None}
+            queue = [src]
+            while queue and dst not in parent:
+                next_queue = []
                 for u in queue:
                     for v, flow in residual[u].items():
                         if flow > 1e-6 and v not in parent:
                             parent[v] = u
-                            nxt.append(v)
-                queue = nxt
+                            next_queue.append(v)
+                queue = next_queue
 
-            if dst_r not in parent:
+            if dst not in parent:
                 break
 
-            path = [dst_r]
-            cur = dst_r
-            while cur != src_r:
+            path = [dst]
+            cur = dst
+            while cur != src:
                 cur = parent[cur]
                 path.append(cur)
             path.reverse()
@@ -367,76 +368,75 @@ def decompose_paths(graph, demands, solution):
 
 
 def install_base_routing(nodes, subnets, graph):
-    """Ensures IP reachability for all subnets so pingall succeeds."""
     router_names = list(graph.keys())
-    for net_obj, info in subnets.items():
-        if not info["routers"]:
+    for subnet_addr, subnet in subnets.items():
+        if not subnet["routers"]:
             continue
-        dst_router = info["routers"][0]["name"]
-        dist, queue = {dst_router: (None, None)}, [dst_router]
+        dst_r_name = subnet["routers"][0]["name"]
+        # reverse BFS from dst_r_name: route[u] = (iface, next_hop) to reach this subnet
+        route, queue = {dst_r_name: (None, None)}, [dst_r_name]
         while queue:
             curr = queue.pop(0)
             for u in router_names:
                 for e in graph[u]:
-                    if e["to"] == curr and u not in dist:
-                        dist[u] = (e["interface"], e["address"])
+                    if e["to"] == curr and u not in route:
+                        route[u] = (e["interface"], e["address"])
                         queue.append(u)
-        for r in router_names:
-            if r != dst_router and r in dist:
-                nodes[r].cmd(
-                    f"ip route add {net_obj} via {dist[r][1]} dev {dist[r][0]}"
-                )
+        for r_name in router_names:
+            if r_name != dst_r_name and r_name in route:
+                iface, via = route[r_name]
+                nodes[r_name].cmd(f"ip route add {subnet_addr} via {via} dev {iface}")
 
 
 def install_mpls_rules(nodes, topology, subnets, graph, demands, decompositions):
-    iface_of = {}
-    for src, edges in graph.items():
-        for edge in edges:
-            iface_of[(src, edge["to"])] = (edge["interface"], edge["address"])
+    link_iface = {
+        (r_name, edge["to"]): (edge["interface"], edge["address"])
+        for r_name, edges in graph.items()
+        for edge in edges
+    }
 
-    host_subnet = {}
-    for subnet_addr, subnet in subnets.items():
-        for host in subnet["hosts"]:
-            host_subnet[host["name"]] = subnet_addr
+    host_subnet = {
+        host["name"]: subnet_addr
+        for subnet_addr, subnet in subnets.items()
+        for host in subnet["hosts"]
+    }
 
     next_label = 100
-    aggregated = {}
+    routes = {}
 
-    for i, (demand_raw, paths) in enumerate(zip(topology["demands"], decompositions)):
-        dst_host = demand_raw["dst"]
-        dst_subnet = host_subnet[dst_host]
-        src_router = demands[i]["src"]
+    for i, paths in enumerate(decompositions):
+        dst_subnet = host_subnet[topology["demands"][i]["dst"]]
+        src_r_name = demands[i]["src"]
 
-        for path_nodes, rate in paths:
-            n_hops = len(path_nodes) - 1
+        for path, rate in paths:
+            n_hops = len(path) - 1
             if n_hops < 1:
                 continue
 
+            # one label per hop; labels[0] is added at the source router
             labels = list(range(next_label, next_label + n_hops))
             next_label += n_hops
-            ifaces = [
-                iface_of[(path_nodes[k], path_nodes[k + 1])] for k in range(n_hops)
-            ]
+            ifaces = [link_iface[(path[k], path[k + 1])] for k in range(n_hops)]
 
             # transit routers: swap in-label to out-label
             for k in range(1, n_hops):
-                router = path_nodes[k]
                 if_name, next_ip = ifaces[k]
-                nodes[router].cmd(
+                nodes[path[k]].cmd(
                     f"ip -f mpls route add {labels[k - 1]} as {labels[k]} "
                     f"via inet {next_ip} dev {if_name}"
                 )
 
             # egress: pop last label
-            nodes[path_nodes[-1]].cmd(f"ip -f mpls route add {labels[-1]} dev lo")
+            nodes[path[-1]].cmd(f"ip -f mpls route add {labels[-1]} dev lo")
 
-            key = (src_router, dst_subnet)
-            aggregated.setdefault(key, []).append((rate, labels[0], ifaces[0]))
+            routes.setdefault((src_r_name, dst_subnet), []).append(
+                (rate, labels[0], ifaces[0])
+            )
 
-    for (src_router, dst_subnet), entries in aggregated.items():
+    for (src_r_name, dst_subnet), entries in routes.items():
         if len(entries) == 1:
             _, first_label, (if_name, next_ip) = entries[0]
-            nodes[src_router].cmd(
+            nodes[src_r_name].cmd(
                 f"ip route replace {dst_subnet} encap mpls {first_label} "
                 f"via {next_ip} dev {if_name}"
             )
@@ -445,7 +445,7 @@ def install_mpls_rules(nodes, topology, subnets, graph, demands, decompositions)
             cmd = f"ip route replace {dst_subnet}"
             for (_, first_label, (if_name, next_ip)), w in zip(entries, weights):
                 cmd += f" nexthop encap mpls {first_label} via {next_ip} dev {if_name} weight {w}"
-            nodes[src_router].cmd(cmd)
+            nodes[src_r_name].cmd(cmd)
 
 
 def start_mininet(topology, subnets, graph, demands, decompositions):
@@ -468,7 +468,6 @@ def start_mininet(topology, subnets, graph, demands, decompositions):
 
     router_names = set(topology["routers"].keys())
 
-    # create nodes
     for subnet in subnets.values():
         for node in subnet["routers"] + subnet["hosts"]:
             name = node["name"]
@@ -480,7 +479,6 @@ def start_mininet(topology, subnets, graph, demands, decompositions):
 
     switch_id = 1
 
-    # wire up
     for subnet_addr, subnet in subnets.items():
         prefix = subnet_addr.prefixlen
         routers = subnet["routers"]
@@ -489,21 +487,19 @@ def start_mininet(topology, subnets, graph, demands, decompositions):
 
         if subnet["switch"] is None and len(all_nodes) == 2:
             a, b = all_nodes[0], all_nodes[1]
-            bw = subnet["cost"] if routers and len(routers) == 2 else None
-            kw = {"bw": bw} if bw else {}
+            bw = subnet["cost"] if len(routers) == 2 else None
             net.addLink(
                 nodes[a["name"]],
                 nodes[b["name"]],
                 intfName1=a["interface"],
                 intfName2=b["interface"],
-                **kw,
+                bw=bw,
             )
             nodes[a["name"]].setIP(f"{a['address']}/{prefix}", intf=a["interface"])
             nodes[b["name"]].setIP(f"{b['address']}/{prefix}", intf=b["interface"])
         else:
-            sw_name = f"s{switch_id}"
+            sw = net.addSwitch(f"s{switch_id}", failMode="standalone")
             switch_id += 1
-            sw = net.addSwitch(sw_name, failMode="standalone")
             for node in all_nodes:
                 net.addLink(nodes[node["name"]], sw, intfName1=node["interface"])
                 nodes[node["name"]].setIP(
@@ -513,13 +509,11 @@ def start_mininet(topology, subnets, graph, demands, decompositions):
     net.build()
     net.start()
 
-    # enable MPLS input on all router interfaces
     for r_name in router_names:
         for intf in nodes[r_name].intfList():
             if intf.name != "lo":
                 nodes[r_name].cmd(f"sysctl -w net.mpls.conf.{intf.name}.input=1")
 
-    # host default gateways
     for subnet in subnets.values():
         if not subnet["hosts"] or not subnet["routers"]:
             continue
@@ -527,9 +521,7 @@ def start_mininet(topology, subnets, graph, demands, decompositions):
         for host in subnet["hosts"]:
             nodes[host["name"]].cmd(f"ip route add default via {gw_ip}")
 
-    # Step 1: Base routing for pingall
     install_base_routing(nodes, subnets, graph)
-    # Step 2: Specialized MPLS optimization
     install_mpls_rules(nodes, topology, subnets, graph, demands, decompositions)
 
     CLI(net)
@@ -548,7 +540,6 @@ def main():
     subnets = get_subnets(topology)
     graph = get_graph(subnets)
 
-    # do_lp -> just print lp definition
     lp = build_lp(topology, subnets, graph)
 
     if do_lp:
@@ -560,7 +551,8 @@ def main():
     if do_print:
         for i, _ in enumerate(topology["demands"]):
             g = solution.get(f"g{i}", 0.0)
-            # Rounded for integer display
+            if g.is_integer():
+                g = int(g)
             print(f"The best goodput for flow demand #{i + 1} is {g} Mbps")
         return
 
