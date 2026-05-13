@@ -11,6 +11,9 @@ from mininet.log import setLogLevel
 from mininet.net import Mininet
 from mininet.node import Node, OVSSwitch
 
+# I discussed with Gianluca Viviano and Giovanni Elisei the choice of
+# using a whole multi-commodity flow LP instead of a fractional one.
+
 
 def parse_command_line():
     parser = argparse.ArgumentParser(
