@@ -551,8 +551,6 @@ def main():
     if do_print:
         for i, _ in enumerate(topology["demands"]):
             g = solution.get(f"g{i}", 0.0)
-            if g.is_integer():
-                g = int(g)
             print(f"The best goodput for flow demand #{i + 1} is {g} Mbps")
         return
 
